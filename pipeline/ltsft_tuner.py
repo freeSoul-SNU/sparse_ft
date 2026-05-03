@@ -7,6 +7,7 @@ Target trainable params: ~170M.
 import logging
 import os
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -16,8 +17,12 @@ from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelFor
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
 
-from lmflow.pipeline.rapa.sift_tuner import SparseLinear  # noqa: E402
+try:
+    from lmflow.pipeline.rapa.sift_tuner import SparseLinear  # noqa: E402
+except ImportError:
+    from sift_tuner import SparseLinear  # noqa: E402
 
 
 class TextDataset(TorchDataset):
@@ -44,12 +49,16 @@ def train_ltsft(
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
 
+    selection_start = time.time()
     layers = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear) and any(t in n for t in target_modules)]
     total_target = sum(m.weight.numel() for _, m in layers)
     sparse_rate = min(target_params / total_target, 1.0) if total_target > 0 else 0.025
     logger.info(f"[LT-SFT] {len(layers)} layers, sparse_rate={sparse_rate:.4f}")
+
+    for param in model.parameters():
+        param.requires_grad = False
 
     for i, (name, module) in enumerate(layers):
         train_num = max(1, int(module.weight.numel() * sparse_rate))
@@ -62,6 +71,7 @@ def train_ltsft(
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[LT-SFT] trainable={trainable:,}")
+    logger.info(f"[LT-SFT] weight_selection_seconds={time.time() - selection_start:.2f}")
 
     with open(dataset_path) as f:
         raw = json.load(f)
@@ -73,12 +83,15 @@ def train_ltsft(
         learning_rate=learning_rate, lr_scheduler_type=lr_scheduler_type, bf16=bf16,
         save_strategy="no" if 0 < max_steps < 100 else "epoch", logging_steps=5,
         report_to=report_to, seed=seed, dataloader_num_workers=4, remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, tokenizer=tokenizer)
     trainer.train(resume_from_checkpoint=get_last_checkpoint(output_dir))
 
-    from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
+    try:
+        from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
+    except ImportError:
+        from sift_tuner import restore_linear_modules
     model = restore_linear_modules(model)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)

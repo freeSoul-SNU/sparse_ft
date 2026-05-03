@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,12 @@ from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 
-SIFT_PATH = "/home1/irteam/rapa/SIFT"
+SPARSE_FT_ROOT = os.environ.get(
+    "SPARSE_FT_ROOT",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+SIFT_PATH = os.environ.get("SIFT_PATH", os.path.join(SPARSE_FT_ROOT, "methods", "sift"))
 if SIFT_PATH not in sys.path:
     sys.path.insert(0, SIFT_PATH)
 
@@ -35,14 +41,22 @@ def restore_linear_modules(model):
     # Import other sparse types if available
     try:
         from lmflow.pipeline.rapa.smt_tuner import BlockSparseLinear
-        sparse_types = sparse_types + (BlockSparseLinear,)
     except ImportError:
-        pass
+        try:
+            from smt_tuner import BlockSparseLinear
+        except ImportError:
+            BlockSparseLinear = None
+    if BlockSparseLinear is not None:
+        sparse_types = sparse_types + (BlockSparseLinear,)
     try:
         from lmflow.pipeline.rapa.s2ft_tuner import RowSparseLinear
-        sparse_types = sparse_types + (RowSparseLinear,)
     except ImportError:
-        pass
+        try:
+            from s2ft_tuner import RowSparseLinear
+        except ImportError:
+            RowSparseLinear = None
+    if RowSparseLinear is not None:
+        sparse_types = sparse_types + (RowSparseLinear,)
 
     for name, module in list(model.named_modules()):
         if isinstance(module, sparse_types):
@@ -221,10 +235,11 @@ def train_sift(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        dtype=torch.bfloat16 if bf16 else torch.float32,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
         **tok_kwargs,
     )
 
+    selection_start = time.time()
     sparse_rate = compute_sparse_rate(model, target_params=target_params, sparse_modules=sparse_modules)
 
     dataset_tag = os.path.basename(dataset_path).replace(".json", "")
@@ -239,13 +254,18 @@ def train_sift(
     )
     sift_obj.print_trainable_parameters()
 
+    for param in model.parameters():
+        param.requires_grad = False
+
     # Replace target Linear with SparseLinear
     model = replace_with_sparse_linear(model, sift_obj, sparse_modules)
+    selection_elapsed = time.time() - selection_start
 
     # Verify trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[SIFT] After replacement: trainable={trainable:,}, total={total:,}")
+    logger.info(f"[SIFT] weight_selection_seconds={selection_elapsed:.2f}")
 
     with open(dataset_path) as f:
         raw = json.load(f)
@@ -267,7 +287,7 @@ def train_sift(
         seed=seed,
         dataloader_num_workers=4,
         remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
 
     trainer = Trainer(

@@ -7,6 +7,7 @@ Target trainable params: ~170M.
 import logging
 import os
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelFor
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
 
 
 class RowSparseLinear(nn.Module):
@@ -69,12 +71,16 @@ def train_s2ft(
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
 
+    selection_start = time.time()
     layers = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear) and any(t in n for t in target_modules)]
     avg_in = sum(m.in_features for _, m in layers) / max(len(layers), 1)
     rows_per_layer = max(1, int(target_params / (len(layers) * avg_in)))
     logger.info(f"[S2FT] {len(layers)} layers, {rows_per_layer} rows/layer")
+
+    for param in model.parameters():
+        param.requires_grad = False
 
     for i, (name, module) in enumerate(layers):
         parts = name.split(".")
@@ -85,6 +91,7 @@ def train_s2ft(
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[S2FT] trainable={trainable:,}")
+    logger.info(f"[S2FT] weight_selection_seconds={time.time() - selection_start:.2f}")
 
     with open(dataset_path) as f:
         raw = json.load(f)
@@ -96,7 +103,7 @@ def train_s2ft(
         learning_rate=learning_rate, lr_scheduler_type=lr_scheduler_type, bf16=bf16,
         save_strategy="no" if 0 < max_steps < 100 else "epoch", logging_steps=5,
         report_to=report_to, seed=seed, dataloader_num_workers=4, remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, tokenizer=tokenizer)
     trainer.train(resume_from_checkpoint=get_last_checkpoint(output_dir))

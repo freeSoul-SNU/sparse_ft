@@ -4,7 +4,14 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-IDX_CACHE_DIR = "/home1/irteam/rapa/checkpoints/.sift_idx_cache"
+IDX_CACHE_DIR = os.environ.get(
+    "SIFT_IDX_CACHE_DIR",
+    os.path.join(
+        os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa"),
+        "checkpoints",
+        ".sift_idx_cache",
+    ),
+)
 
 
 def _cache_key(model_name, sparse_rate, sparse_modules, seed=42, dataset_name=""):

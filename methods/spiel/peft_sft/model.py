@@ -11,22 +11,23 @@ from tqdm import tqdm
 
 import numpy as np
 
-from peft.import_utils import is_bnb_available
 from peft.tuners.tuners_utils import BaseTuner
-from peft.utils import (
-    COMMON_LAYERS_PATTERN,
-    ModulesToSaveWrapper,
-    _freeze_adapter,
-    _get_submodules,
-)
+from peft.utils import ModulesToSaveWrapper
 
-if is_bnb_available():
+COMMON_LAYERS_PATTERN = ["layers", "h", "block", "blocks", "layer"]
+
+try:
     import bitsandbytes as bnb
     try:
         from bitsandbytes.functional import QuantState
         BNB_QUANT_STATE = True
     except ImportError:
         BNB_QUANT_STATE = False
+    BNB_AVAILABLE = True
+except Exception:
+    bnb = None
+    BNB_QUANT_STATE = False
+    BNB_AVAILABLE = False
 
 from .config import SftConfig
 from .layer import AddSparseDelta, Linear, SparseDelta
@@ -37,7 +38,7 @@ logger.setLevel(logging.INFO)
 
 
 def original_numel(p):
-    if is_bnb_available() and isinstance(p, bnb.nn.Params4bit):
+    if BNB_AVAILABLE and isinstance(p, bnb.nn.Params4bit):
         return np.prod(p.quant_state.shape if BNB_QUANT_STATE else p.quant_state[1])
     else:
         return p.numel()
@@ -60,6 +61,15 @@ class SftModel(BaseTuner):
         for n, m in self.named_modules():
             if isinstance(m, Linear) and m.active_adapter in m.sft_delta:
                 yield m, f'{n}.sft_delta.{m.active_adapter}', m.sft_delta[m.active_adapter]
+
+    def print_trainable_parameters(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(original_numel(p) for p in self.parameters())
+        ratio = 100 * trainable / total if total else 0.0
+        print(
+            f"trainable params: {trainable:,d} || all params: {total:,d} || "
+            f"trainable%: {ratio:.2f}"
+        )
 
     def _get_ancestry(self, module_name):
         current_module = self.model.get_submodule(module_name)
@@ -151,7 +161,7 @@ class SftModel(BaseTuner):
             linear_kwargs = {
                 'dtype': dtype,
             }
-            if is_bnb_available() and linear_type == bnb.nn.Linear4bit:
+            if BNB_AVAILABLE and linear_type == bnb.nn.Linear4bit:
                 linear_kwargs['compute_dtype'] = original_module.compute_dtype
                 linear_kwargs['compress_statistics'] = original_module.weight.compress_statistics
                 linear_kwargs['quant_type'] = original_module.weight.quant_type

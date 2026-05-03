@@ -51,9 +51,9 @@ def parse_args():
 
 
 def truncate_dataset_for_smoke(dataset_path, n=100):
-    """Create a tiny dataset subset for smoke testing. Saved in /home1/irteam/rapa/data/ to avoid OOM."""
+    """Create a tiny dataset subset for smoke testing."""
     import json, hashlib
-    out_dir = "/home1/irteam/rapa/data"
+    out_dir = os.path.join(os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa"), "data")
     os.makedirs(out_dir, exist_ok=True)
     key = hashlib.md5(f"{dataset_path}_{n}".encode()).hexdigest()[:8]
     out_path = os.path.join(out_dir, f"smoke_{key}.json")
@@ -102,7 +102,10 @@ def main():
         os.environ["RAPA_MAX_STEPS"] = str(max_steps)
         common_kwargs["max_steps"] = max_steps
 
-    from lmflow.pipeline.rapa import METHODS
+    try:
+        from lmflow.pipeline.rapa import METHODS
+    except ImportError:
+        from pipeline import METHODS
     train_fn = METHODS[args.method]
 
     logger.info(f"=== Starting {args.method.upper()} training ===")

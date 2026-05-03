@@ -36,7 +36,7 @@ train_and_eval() {
         echo "[${TASK}] Training: ${METHOD}"
         PORT=$((29600 + RANDOM % 1000))
         deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=${PORT} \
-            examples/rapa/train_method.py \
+            pipeline/train_method.py \
             --method ${METHOD} \
             --model_name_or_path ${MODEL} \
             --dataset_path ${DATA} \
@@ -63,21 +63,21 @@ train_and_eval() {
         # Evaluate
         if [ "${TASK}" = "mtbench" ]; then
             echo "[${TASK}] Evaluating ${METHOD} with MT-Bench (vLLM + GPT-4o-mini)"
-            python examples/rapa/eval_mtbench.py \
+            python pipeline/eval_mtbench.py \
                 --model_path "${CKPT}" --method "${METHOD}" \
                 --results_file "${RESULTS}" --judge "gpt-4o-mini" \
                 --openai_api_key "${OPENAI_API_KEY}" --num_gpus 8 \
                 2>&1 | tee "${LOG}/eval.log"
         elif [ "${TASK}" = "mmlu" ]; then
             echo "[${TASK}] Evaluating ${METHOD} with MMLU 5-shot (vLLM)"
-            python examples/rapa/eval_lmharness.py \
+            python pipeline/eval_lmharness.py \
                 --model_path "${CKPT}" --method "${METHOD}" \
                 --task mmlu --num_fewshot 5 \
                 --results_file "${RESULTS}" --num_gpus 8 \
                 2>&1 | tee "${LOG}/eval.log"
         elif [ "${TASK}" = "csr" ]; then
             echo "[${TASK}] Evaluating ${METHOD} with CSR 0-shot (vLLM)"
-            python examples/rapa/eval_lmharness.py \
+            python pipeline/eval_lmharness.py \
                 --model_path "${CKPT}" --method "${METHOD}" \
                 --task csr --num_fewshot 0 \
                 --results_file "${RESULTS}" --num_gpus 8 \

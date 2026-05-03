@@ -8,13 +8,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from peft.import_utils import is_bnb_available
-from peft.tuners.tuners_utils import BaseTunerLayer
 import linear_sd
 
-BNB_AVAILABLE = is_bnb_available()
-if BNB_AVAILABLE:
+try:
     import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except Exception:
+    bnb = None
+    BNB_AVAILABLE = False
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ class SparseDelta(nn.Module):
         self.merge(tensor, negate=True)
 
 
-class Linear(BaseTunerLayer):
+class Linear:
     pass
 
 

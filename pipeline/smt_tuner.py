@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelFor
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
 
 BLOCK_DIM = 256  # SMT block dimension
 
@@ -130,11 +132,15 @@ def train_smt(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        dtype=torch.bfloat16 if bf16 else torch.float32,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
         **tok_kwargs,
     )
 
+    selection_start = time.time()
     blocks_per_layer = compute_blocks_per_layer(model, target_params, target_modules)
+
+    for param in model.parameters():
+        param.requires_grad = False
 
     # Replace target Linear with BlockSparseLinear
     replacements = 0
@@ -151,6 +157,7 @@ def train_smt(
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[SMT] Replaced {replacements} layers, trainable={trainable:,}, total params={total:,}")
+    logger.info(f"[SMT] weight_selection_seconds={time.time() - selection_start:.2f}")
 
     with open(dataset_path) as f:
         raw = json.load(f)
@@ -172,7 +179,7 @@ def train_smt(
         seed=seed,
         dataloader_num_workers=4,
         remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
 
     trainer = Trainer(

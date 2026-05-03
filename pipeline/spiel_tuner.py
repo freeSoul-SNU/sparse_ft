@@ -1,12 +1,9 @@
-"""SpiEL (Sparse Fine-Tuning) integration within LMFlow.
-Uses SftConfig from the AlanAnsell/peft fork for sparse instruction tuning.
-Target trainable params: ~170M.
-Repo: https://github.com/ducdauge/sft-llm (FT) + https://github.com/AlanAnsell/peft (tuner)
-"""
+"""SpiEL (Sparse Fine-Tuning) integration within LMFlow."""
 import logging
 import os
 import sys
 import json
+import time
 
 import torch
 from transformers import (
@@ -17,10 +14,20 @@ from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 
-PEFT_SFT_PATH = "/home1/irteam/rapa/peft/src"
-PEFT_SFT_LAYER = "/home1/irteam/rapa/peft/src/peft/tuners/sft"
-# Force fork's peft to override installed peft
-for p in [PEFT_SFT_LAYER, PEFT_SFT_PATH]:
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+PEFT_ROOT = os.environ.get("PEFT_DIR", os.path.join(RAPA_HOME, "peft"))
+PEFT_SFT_PATH = os.path.join(PEFT_ROOT, "src")
+SPARSE_FT_ROOT = os.environ.get(
+    "SPARSE_FT_ROOT",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..")),
+)
+SPIEL_ROOT = os.path.join(SPARSE_FT_ROOT, "methods", "spiel")
+SPIEL_SFT_PATH = os.path.join(SPIEL_ROOT, "peft_sft")
+SPIEL_LINEAR_SD_BUILD = os.path.join(
+    SPIEL_SFT_PATH, "linear-sd", "build", "lib.linux-x86_64-cpython-310"
+)
+# Force the local PEFT fork and SpiEL implementation to override installed packages.
+for p in [PEFT_SFT_PATH, SPIEL_ROOT, SPIEL_SFT_PATH, SPIEL_LINEAR_SD_BUILD]:
     if p not in sys.path:
         sys.path.insert(0, p)
 # Remove cached peft module so fork gets loaded
@@ -47,7 +54,8 @@ def train_spiel(
     report_to="none",
     **kwargs,
 ):
-    from peft import get_peft_model, SftConfig, TaskType
+    from peft.utils import TaskType
+    from peft_sft import SftConfig, SftModel
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -58,11 +66,14 @@ def train_spiel(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        dtype=torch.bfloat16 if bf16 else torch.float32,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
         **tok_kwargs,
     )
 
-    # Compute total params in linear layers
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Compute total params in linear layers.
     total_linear = sum(
         p.numel() for n, p in model.named_parameters()
         if any(x in n for x in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
@@ -71,13 +82,17 @@ def train_spiel(
     density = min(target_params / total_linear, 1.0) if total_linear > 0 else 0.025
     logger.info(f"[SpiEL] total_linear={total_linear:,}, density={density:.4f}")
 
+    selection_start = time.time()
     peft_config = SftConfig(
         task_type=TaskType.CAUSAL_LM,
         density=density,
+        num_tunable_weights=target_params,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        dtype="bfloat16" if bf16 else "float32",
     )
-    model = get_peft_model(model, peft_config)
+    model = SftModel(model, peft_config, adapter_name="default")
     model.print_trainable_parameters()
+    logger.info(f"[SpiEL] weight_selection_seconds={time.time() - selection_start:.2f}")
 
     # Load dataset
     with open(dataset_path) as f:
@@ -116,7 +131,7 @@ def train_spiel(
         dataloader_num_workers=4,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
 
     trainer = Trainer(

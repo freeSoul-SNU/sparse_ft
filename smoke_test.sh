@@ -4,7 +4,7 @@
 # Others → deepspeed ZeRO-1
 set -euo pipefail
 
-RAPA_BASE="/home1/irteam/rapa"
+RAPA_BASE="/home/nksol0405/LLM/rapa"
 LMFLOW_DIR="${RAPA_BASE}/LMFlow"
 DATA_DIR="${RAPA_BASE}/data"
 CKPT_DIR="${RAPA_BASE}/checkpoints"
