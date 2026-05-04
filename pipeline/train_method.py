@@ -2,7 +2,7 @@
 """
 Unified training entrypoint for all RAPA methods within LMFlow.
 Dispatches to the correct tuner based on --method argument.
-All training uses 8 GPUs via torchrun / deepspeed.
+Training is launched from the shell scripts through srun, then deepspeed.
 """
 import argparse
 import logging
@@ -39,6 +39,20 @@ def parse_args():
     p.add_argument("--max_seq_length", type=int, default=512)
     p.add_argument("--target_params", type=int, default=170_000_000,
                    help="Target number of trainable parameters (~170M)")
+    p.add_argument("--smt_calibration_steps", type=int, default=None,
+                   help="SMT gradient calibration steps before block selection (default: env SMT_CALIBRATION_STEPS or 100)")
+    p.add_argument("--smt_calibration_batch_size", type=int, default=None,
+                   help="SMT gradient calibration batch size (default: env SMT_CALIBRATION_BATCH_SIZE or 1)")
+    p.add_argument("--sift_calibration_steps", type=int, default=None,
+                   help="SIFT gradient calibration steps before top-k selection (default: env SIFT_CALIBRATION_STEPS or 1)")
+    p.add_argument("--sift_calibration_batch_size", type=int, default=None,
+                   help="SIFT gradient calibration batch size (default: env SIFT_CALIBRATION_BATCH_SIZE or 1)")
+    p.add_argument("--s2ft_calibration_steps", type=int, default=None,
+                   help="S2FT activation calibration steps before head/channel selection (default: env S2FT_CALIBRATION_STEPS or 100)")
+    p.add_argument("--s2ft_calibration_batch_size", type=int, default=None,
+                   help="S2FT activation calibration batch size (default: env S2FT_CALIBRATION_BATCH_SIZE or 1)")
+    p.add_argument("--ltsft_mask_search_steps", type=int, default=None,
+                   help="LT-SFT dense lottery-ticket mask-search steps (default: env LTSFT_MASK_SEARCH_STEPS or 100)")
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--hf_token", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -51,9 +65,9 @@ def parse_args():
 
 
 def truncate_dataset_for_smoke(dataset_path, n=100):
-    """Create a tiny dataset subset for smoke testing. Saved in /home1/irteam/rapa/data/ to avoid OOM."""
+    """Create a tiny dataset subset for smoke testing."""
     import json, hashlib
-    out_dir = "/home1/irteam/rapa/data"
+    out_dir = os.path.join(os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa"), "data")
     os.makedirs(out_dir, exist_ok=True)
     key = hashlib.md5(f"{dataset_path}_{n}".encode()).hexdigest()[:8]
     out_path = os.path.join(out_dir, f"smoke_{key}.json")
@@ -97,12 +111,29 @@ def main():
         seed=args.seed,
         report_to=args.report_to,
     )
+    if args.smt_calibration_steps is not None:
+        common_kwargs["smt_calibration_steps"] = args.smt_calibration_steps
+    if args.smt_calibration_batch_size is not None:
+        common_kwargs["smt_calibration_batch_size"] = args.smt_calibration_batch_size
+    if args.sift_calibration_steps is not None:
+        common_kwargs["sift_calibration_steps"] = args.sift_calibration_steps
+    if args.sift_calibration_batch_size is not None:
+        common_kwargs["sift_calibration_batch_size"] = args.sift_calibration_batch_size
+    if args.s2ft_calibration_steps is not None:
+        common_kwargs["s2ft_calibration_steps"] = args.s2ft_calibration_steps
+    if args.s2ft_calibration_batch_size is not None:
+        common_kwargs["s2ft_calibration_batch_size"] = args.s2ft_calibration_batch_size
+    if args.ltsft_mask_search_steps is not None:
+        common_kwargs["ltsft_mask_search_steps"] = args.ltsft_mask_search_steps
     # Inject max_steps into TrainingArguments via env
     if max_steps > 0:
         os.environ["RAPA_MAX_STEPS"] = str(max_steps)
         common_kwargs["max_steps"] = max_steps
 
-    from lmflow.pipeline.rapa import METHODS
+    try:
+        from lmflow.pipeline.rapa import METHODS
+    except ImportError:
+        from pipeline import METHODS
     train_fn = METHODS[args.method]
 
     logger.info(f"=== Starting {args.method.upper()} training ===")

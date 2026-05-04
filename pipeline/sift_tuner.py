@@ -12,21 +12,68 @@ import logging
 import os
 import sys
 import json
+import time
+import threading
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 
-SIFT_PATH = "/home1/irteam/rapa/SIFT"
+SPARSE_FT_ROOT = os.environ.get(
+    "SPARSE_FT_ROOT",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+SIFT_PATH = os.environ.get("SIFT_PATH", os.path.join(SPARSE_FT_ROOT, "methods", "sift"))
 if SIFT_PATH not in sys.path:
     sys.path.insert(0, SIFT_PATH)
 
 from sift import SIFT  # noqa: E402
+
+
+def _deepspeed_config(default_path):
+    value = os.environ.get("DS_CONFIG", default_path)
+    if value.lower() in {"", "0", "false", "none", "no"}:
+        return None
+    return value
+
+
+def _read_self_rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+class PeakRSSMonitor:
+    def __init__(self, interval=0.2):
+        self.interval = interval
+        self.peak_mb = _read_self_rss_mb()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.peak_mb = max(self.peak_mb, _read_self_rss_mb())
+            self._stop.wait(self.interval)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self.peak_mb = max(self.peak_mb, _read_self_rss_mb())
+        self._stop.set()
+        self._thread.join()
+        return self.peak_mb
 
 
 def restore_linear_modules(model):
@@ -35,14 +82,22 @@ def restore_linear_modules(model):
     # Import other sparse types if available
     try:
         from lmflow.pipeline.rapa.smt_tuner import BlockSparseLinear
-        sparse_types = sparse_types + (BlockSparseLinear,)
     except ImportError:
-        pass
+        try:
+            from smt_tuner import BlockSparseLinear
+        except ImportError:
+            BlockSparseLinear = None
+    if BlockSparseLinear is not None:
+        sparse_types = sparse_types + (BlockSparseLinear,)
     try:
         from lmflow.pipeline.rapa.s2ft_tuner import RowSparseLinear
-        sparse_types = sparse_types + (RowSparseLinear,)
     except ImportError:
-        pass
+        try:
+            from s2ft_tuner import RowSparseLinear
+        except ImportError:
+            RowSparseLinear = None
+    if RowSparseLinear is not None:
+        sparse_types = sparse_types + (RowSparseLinear,)
 
     for name, module in list(model.named_modules()):
         if isinstance(module, sparse_types):
@@ -190,6 +245,72 @@ class TextDataset(TorchDataset):
         return self.data[i]
 
 
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def select_sift_gradient_indices(
+    model,
+    train_dataset,
+    sparse_rate,
+    sparse_modules,
+    calibration_steps=1,
+    calibration_batch_size=1,
+):
+    """Select SIFT coordinates using top-k accumulated absolute gradients."""
+    device = next(model.parameters()).device
+    target_params = {
+        name: param
+        for name, param in model.named_parameters()
+        if param.ndim == 2 and any(module in name for module in sparse_modules)
+    }
+    scores = {}
+
+    for param in model.parameters():
+        param.requires_grad = False
+        param.grad = None
+    for param in target_params.values():
+        param.requires_grad = True
+
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    model.train()
+
+    loader = DataLoader(train_dataset, batch_size=calibration_batch_size, shuffle=False, num_workers=0)
+    completed_steps = 0
+    for step, batch in enumerate(loader, start=1):
+        if step > calibration_steps:
+            break
+
+        model.zero_grad(set_to_none=True)
+        outputs = model(**_move_batch_to_device(batch, device))
+        outputs.loss.backward()
+
+        for name, param in target_params.items():
+            if param.grad is None:
+                continue
+            grad_score = param.grad.detach().abs().float().cpu()
+            if name in scores:
+                scores[name].add_(grad_score)
+            else:
+                scores[name] = grad_score
+            param.grad = None
+
+        completed_steps = step
+        logger.info(f"[SIFT] calibration_progress={step}/{calibration_steps}")
+
+    sparse_indices = {}
+    for name, score in scores.items():
+        train_num = min(max(1, int(sparse_rate * score.numel()) + 1), score.numel())
+        flat_idx = torch.topk(score.reshape(-1), k=train_num, largest=True, sorted=False).indices.cpu()
+        sparse_indices[name] = flat_idx
+
+    model.zero_grad(set_to_none=True)
+    for param in target_params.values():
+        param.requires_grad = False
+    return sparse_indices, completed_steps
+
+
 def train_sift(
     model_name_or_path,
     dataset_path,
@@ -207,6 +328,8 @@ def train_sift(
     hf_token=None,
     seed=42,
     report_to="none",
+    sift_calibration_steps=None,
+    sift_calibration_batch_size=None,
     **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -221,35 +344,114 @@ def train_sift(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        dtype=torch.bfloat16 if bf16 else torch.float32,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
         **tok_kwargs,
     )
 
+    with open(dataset_path) as f:
+        raw = json.load(f)
+    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+
+    selection_start = time.time()
     sparse_rate = compute_sparse_rate(model, target_params=target_params, sparse_modules=sparse_modules)
 
-    dataset_tag = os.path.basename(dataset_path).replace(".json", "")
-    sift_obj = SIFT(
-        model=model,
-        sparse_rate=sparse_rate,
-        sparse_module=sparse_modules,
-        grad_acc=gradient_accumulation_steps,
-        model_name=model_name_or_path,
-        seed=seed,
-        dataset_name=dataset_tag,
-    )
-    sift_obj.print_trainable_parameters()
+    use_gradient_calibration = os.environ.get("SIFT_USE_GRADIENT_CALIBRATION", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if use_gradient_calibration:
+        calibration_steps = int(
+            sift_calibration_steps
+            if sift_calibration_steps is not None
+            else os.environ.get("SIFT_CALIBRATION_STEPS", "1")
+        )
+        calibration_batch_size = int(
+            sift_calibration_batch_size
+            if sift_calibration_batch_size is not None
+            else os.environ.get("SIFT_CALIBRATION_BATCH_SIZE", "1")
+        )
+        if torch.cuda.is_available():
+            model.to(torch.device("cuda"))
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        calibration_start = time.time()
+        logger.info(
+            f"[SIFT] Starting gradient calibration: steps={calibration_steps}, "
+            f"batch_size={calibration_batch_size}"
+        )
+        cpu_monitor = PeakRSSMonitor()
+        cpu_monitor.start()
+        try:
+            sparse_indices, completed_calibration_steps = select_sift_gradient_indices(
+                model=model,
+                train_dataset=train_dataset,
+                sparse_rate=sparse_rate,
+                sparse_modules=sparse_modules,
+                calibration_steps=calibration_steps,
+                calibration_batch_size=calibration_batch_size,
+            )
+        finally:
+            calibration_peak_cpu_rss = cpu_monitor.stop()
+        calibration_elapsed = time.time() - calibration_start
+        calibration_peak_allocated = 0
+        calibration_peak_reserved = 0
+        if torch.cuda.is_available():
+            calibration_peak_allocated = torch.cuda.max_memory_allocated() // (1024 * 1024)
+            calibration_peak_reserved = torch.cuda.max_memory_reserved() // (1024 * 1024)
+            torch.cuda.empty_cache()
+        logger.info(f"[SIFT] completed_calibration_steps={completed_calibration_steps}")
+        logger.info(f"[SIFT] calibration_seconds={calibration_elapsed:.2f}")
+        logger.info(f"[SIFT] calibration_peak_allocated_mb={calibration_peak_allocated}")
+        logger.info(f"[SIFT] calibration_peak_reserved_mb={calibration_peak_reserved}")
+        logger.info(f"[SIFT] calibration_peak_cpu_rss_mb={calibration_peak_cpu_rss}")
+        if os.environ.get("SIFT_CALIBRATION_ONLY", "false").lower() in {"1", "true", "yes"}:
+            indices_path = os.path.join(output_dir, "sift_calibration_indices.pt")
+            torch.save(
+                {
+                    "sparse_indices": sparse_indices,
+                    "sparse_rate": sparse_rate,
+                    "sparse_modules": sparse_modules,
+                    "target_params": target_params,
+                    "calibration_steps": calibration_steps,
+                    "calibration_batch_size": calibration_batch_size,
+                    "completed_calibration_steps": completed_calibration_steps,
+                    "calibration_seconds": calibration_elapsed,
+                    "calibration_peak_allocated_mb": calibration_peak_allocated,
+                    "calibration_peak_reserved_mb": calibration_peak_reserved,
+                    "calibration_peak_cpu_rss_mb": calibration_peak_cpu_rss,
+                },
+                indices_path,
+            )
+            logger.info(f"[SIFT] Calibration-only complete. Saved indices to {indices_path}")
+            return output_dir
+        sift_obj = type("SiftSelection", (), {"sparse_indices": sparse_indices})()
+    else:
+        dataset_tag = os.path.basename(dataset_path).replace(".json", "")
+        sift_obj = SIFT(
+            model=model,
+            sparse_rate=sparse_rate,
+            sparse_module=sparse_modules,
+            grad_acc=gradient_accumulation_steps,
+            model_name=model_name_or_path,
+            seed=seed,
+            dataset_name=dataset_tag,
+        )
+        sift_obj.print_trainable_parameters()
+
+    for param in model.parameters():
+        param.requires_grad = False
 
     # Replace target Linear with SparseLinear
     model = replace_with_sparse_linear(model, sift_obj, sparse_modules)
+    selection_elapsed = time.time() - selection_start
 
     # Verify trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[SIFT] After replacement: trainable={trainable:,}, total={total:,}")
-
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    logger.info(f"[SIFT] weight_selection_seconds={selection_elapsed:.2f}")
 
     save_strategy = "no" if 0 < max_steps < 100 else "epoch"
     training_args = TrainingArguments(
@@ -267,7 +469,7 @@ def train_sift(
         seed=seed,
         dataloader_num_workers=4,
         remove_unused_columns=False,
-        deepspeed="/home1/irteam/rapa/LMFlow/configs/rapa/ds_zero1_sift.json",
+        deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
 
     trainer = Trainer(
@@ -277,8 +479,16 @@ def train_sift(
         tokenizer=tokenizer,
     )
 
-    last_checkpoint = get_last_checkpoint(output_dir)
+    resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}
+    existing_checkpoint = get_last_checkpoint(output_dir)
+    last_checkpoint = existing_checkpoint if resume_training else None
+    if existing_checkpoint and not resume_training:
+        logger.warning(f"[SIFT] Ignoring existing checkpoint because RESUME_TRAINING=false: {existing_checkpoint}")
     trainer.train(resume_from_checkpoint=last_checkpoint)
+
+    if os.environ.get("RAPA_SKIP_SAVE", "false").lower() in {"1", "true", "yes"}:
+        logger.info("[SIFT] RAPA_SKIP_SAVE=true; skipping model save for profiling")
+        return output_dir
 
     # Restore SparseLinear → nn.Linear (clean model for vLLM/HF loading)
     model = restore_linear_modules(model)

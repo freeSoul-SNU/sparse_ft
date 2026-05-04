@@ -1,0 +1,15 @@
+name: sparse-ft
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools>=68
+  - wheel
+  - ninja
+  - cmake
+  - git
+  - gcc_linux-64
+  - gxx_linux-64
+  - make
+  - pkg-config

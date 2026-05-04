@@ -93,5 +93,4 @@ class SftConfig(PeftConfig):
     )
 
     def __post_init__(self):
-        self.peft_type = PeftType.SFT
-
+        self.peft_type = "SFT"
