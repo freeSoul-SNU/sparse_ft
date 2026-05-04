@@ -2,15 +2,15 @@
 """
 Prepare all datasets in LMFlow format.
 - oasst1 (timdettmers/openassistant-guanaco) for MT-Bench methods
-- MMLU from /home1/irteam/datasets/mmlu/mmlu.json (already in LMFlow format)
-- CSR from /home1/irteam/datasets/merge/merge.json (already in LMFlow format)
+- MMLU from RAPA_HOME/OwLore_Dataset/mmlu/mmlu.json when present
+- CSR from CSR_DATASET when present
 """
 import json
 import os
 import sys
 from datasets import load_dataset
 
-RAPA_BASE = "/home1/irteam/rapa"
+RAPA_BASE = os.environ.get("RAPA_HOME", "/home/mms/freeSoul/llm/rapa")
 DATA_DIR = os.path.join(RAPA_BASE, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -51,8 +51,8 @@ if __name__ == "__main__":
     oasst1_path = prepare_oasst1()
     print(f"\n[oasst1] Path: {oasst1_path}")
 
-    mmlu_path = "/home1/irteam/datasets/mmlu/mmlu.json"
-    csr_path = "/home1/irteam/datasets/merge/merge.json"
+    mmlu_path = os.environ.get("MMLU_DATASET", os.path.join(RAPA_BASE, "OwLore_Dataset", "mmlu", "mmlu.json"))
+    csr_path = os.environ.get("CSR_DATASET", os.path.join(RAPA_BASE, "OwLore_Dataset", "merge", "merge.json"))
     check_existing(mmlu_path, "MMLU")
     check_existing(csr_path, "CSR")
 

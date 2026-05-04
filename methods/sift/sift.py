@@ -7,7 +7,7 @@ import numpy as np
 IDX_CACHE_DIR = os.environ.get(
     "SIFT_IDX_CACHE_DIR",
     os.path.join(
-        os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa"),
+        os.environ.get("RAPA_HOME", "/home/mms/freeSoul/llm/rapa"),
         "checkpoints",
         ".sift_idx_cache",
     ),
@@ -23,7 +23,8 @@ class SIFT():
     """DeepSpeed-compatible SIFT. Frozen model params + trainable sparse_params."""
 
     def __init__(self, model, sparse_rate, sparse_module, exception=[], grad_acc=1,
-                 gradient_checkpointing=False, model_name="", seed=42, dataset_name="") -> None:
+                 gradient_checkpointing=False, model_name="", seed=42, dataset_name="",
+                 sparse_indices=None) -> None:
         self.model = model
         self.total_num = 0
         self.sparse_rate = sparse_rate
@@ -31,6 +32,7 @@ class SIFT():
         self.exception = exception
         self.sparse_mapping = dict()  # name -> sparse_param
         self.sparse_indices = dict()  # name -> flat_idx (torch.LongTensor)
+        self.provided_sparse_indices = sparse_indices or {}
 
         # Cache path (.pt for fast load)
         self._cache_path = None
@@ -65,8 +67,20 @@ class SIFT():
                     # FAST PATH: use cached indices, skip generation entirely
                     flat_idx = cached[cache_key]
                 else:
-                    # SLOW PATH (first run only): generate random indices
-                    flat_idx = torch.randint(0, p.numel(), (train_num,), dtype=torch.long)
+                    if n in self.provided_sparse_indices:
+                        flat_idx = self.provided_sparse_indices[n].to(dtype=torch.long, device="cpu")
+                    elif p.grad is not None:
+                        flat_idx = torch.topk(
+                            p.grad.detach().abs().reshape(-1).float().cpu(),
+                            k=train_num,
+                            largest=True,
+                            sorted=False,
+                        ).indices
+                    else:
+                        raise ValueError(
+                            "SIFT requires gradient-based sparse indices. Run a calibration "
+                            "backward pass first or pass sparse_indices; random selection is disabled."
+                        )
                     idx_to_save[cache_key] = flat_idx
 
                 self.sparse_indices[n] = flat_idx

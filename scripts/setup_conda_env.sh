@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-sparse-ft}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
-RAPA_HOME="${RAPA_HOME:-/home1/irteam/rapa}"
+ENV_NAME="${ENV_NAME:-rapa_h200}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.9}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${REPO_ROOT}/scripts/env_utils.sh"
+
+LLM_ROOT="${LLM_ROOT:-$(cd "${REPO_ROOT}/.." && pwd)}"
+RAPA_HOME="${RAPA_HOME:-${LLM_ROOT}/rapa}"
 LMFLOW_DIR="${LMFLOW_DIR:-${RAPA_HOME}/LMFlow}"
 PEFT_DIR="${PEFT_DIR:-${RAPA_HOME}/peft}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${RAPA_HOME}/conda_envs/${ENV_NAME}}"
 LINEAR_SD_DIR="${REPO_ROOT}/methods/spiel/peft_sft/linear-sd"
 
-if ! command -v conda >/dev/null 2>&1; then
-    echo "conda command was not found."
-    exit 1
+mkdir -p "${RAPA_HOME}" "$(dirname "${CONDA_ENV_PREFIX}")"
+init_conda_shell
+
+if [ ! -d "${CONDA_ENV_PREFIX}" ]; then
+    conda env create -f "${REPO_ROOT}/environment.yml" -p "${CONDA_ENV_PREFIX}"
 fi
 
-eval "$(conda shell.bash hook)"
-
-if ! conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
-    conda env create -f "${REPO_ROOT}/environment.yml" -n "${ENV_NAME}"
-fi
-
-conda activate "${ENV_NAME}"
+conda activate "${CONDA_ENV_PREFIX}"
 python --version >/dev/null
 pip install --upgrade pip
 
@@ -42,8 +42,6 @@ pip install \
     "scipy>=1.12" \
     "scikit-learn>=1.4"
 
-mkdir -p "${RAPA_HOME}"
-
 if [ ! -d "${LMFLOW_DIR}" ]; then
     git clone https://github.com/OptimalScale/LMFlow.git "${LMFLOW_DIR}"
 elif [ ! -d "${LMFLOW_DIR}/.git" ]; then
@@ -63,12 +61,13 @@ cp -r "${REPO_ROOT}/pipeline/." "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/"
 cp -r "${REPO_ROOT}/configs/." "${LMFLOW_DIR}/configs/rapa/"
 
 if [ -d "${LINEAR_SD_DIR}" ]; then
-    (cd "${LINEAR_SD_DIR}" && python setup.py install)
+    (cd "${LINEAR_SD_DIR}" && CC="${CC:-/usr/bin/gcc}" CXX="${CXX:-/usr/bin/g++}" python setup.py build_ext --inplace)
 fi
 
 cat <<EOF
 Environment is ready.
 - conda env: ${ENV_NAME}
+- conda prefix: ${CONDA_ENV_PREFIX}
 - LMFlow: ${LMFLOW_DIR}
 - PEFT fork: ${PEFT_DIR}
 

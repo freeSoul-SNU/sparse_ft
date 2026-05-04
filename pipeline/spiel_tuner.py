@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import json
+import sysconfig
 import time
 
 import torch
@@ -14,7 +15,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 
-RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+RAPA_HOME = os.environ.get("RAPA_HOME", "/home/mms/freeSoul/llm/rapa")
 PEFT_ROOT = os.environ.get("PEFT_DIR", os.path.join(RAPA_HOME, "peft"))
 PEFT_SFT_PATH = os.path.join(PEFT_ROOT, "src")
 SPARSE_FT_ROOT = os.environ.get(
@@ -23,11 +24,14 @@ SPARSE_FT_ROOT = os.environ.get(
 )
 SPIEL_ROOT = os.path.join(SPARSE_FT_ROOT, "methods", "spiel")
 SPIEL_SFT_PATH = os.path.join(SPIEL_ROOT, "peft_sft")
+SPIEL_LINEAR_SD_DIR = os.path.join(SPIEL_SFT_PATH, "linear-sd")
 SPIEL_LINEAR_SD_BUILD = os.path.join(
-    SPIEL_SFT_PATH, "linear-sd", "build", "lib.linux-x86_64-cpython-310"
+    SPIEL_LINEAR_SD_DIR,
+    "build",
+    f"lib.{sysconfig.get_platform()}-{sys.implementation.cache_tag}",
 )
 # Force the local PEFT fork and SpiEL implementation to override installed packages.
-for p in [PEFT_SFT_PATH, SPIEL_ROOT, SPIEL_SFT_PATH, SPIEL_LINEAR_SD_BUILD]:
+for p in [PEFT_SFT_PATH, SPIEL_ROOT, SPIEL_SFT_PATH, SPIEL_LINEAR_SD_DIR, SPIEL_LINEAR_SD_BUILD]:
     if p not in sys.path:
         sys.path.insert(0, p)
 # Remove cached peft module so fork gets loaded
@@ -56,6 +60,7 @@ def train_spiel(
 ):
     from peft.utils import TaskType
     from peft_sft import SftConfig, SftModel
+    from peft_sft.trainer import SftTrainer
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -89,6 +94,11 @@ def train_spiel(
         num_tunable_weights=target_params,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         dtype="bfloat16" if bf16 else "float32",
+        selection_algorithm=os.environ.get("SPIEL_SELECTION_ALGORITHM", "rigl"),
+        reselection_steps=int(os.environ.get("SPIEL_RESELECTION_STEPS", "20")),
+        selection_accumulation_steps=int(os.environ.get("SPIEL_SELECTION_ACCUMULATION_STEPS", "5")),
+        reselection_rate_policy=os.environ.get("SPIEL_RESELECTION_RATE_POLICY", "linear"),
+        initial_reselection_rate=float(os.environ.get("SPIEL_INITIAL_RESELECTION_RATE", "0.2")),
     )
     model = SftModel(model, peft_config, adapter_name="default")
     model.print_trainable_parameters()
@@ -134,11 +144,13 @@ def train_spiel(
         deepspeed=os.environ.get("DS_CONFIG", os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
 
-    trainer = Trainer(
+    SpiELTrainer = SftTrainer(Trainer)
+    trainer = SpiELTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        sft_config=peft_config,
     )
 
     last_checkpoint = get_last_checkpoint(output_dir)

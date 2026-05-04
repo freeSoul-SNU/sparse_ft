@@ -1,9 +1,10 @@
-"""SMT (Sparse Matrix Tuning) — DeepSpeed 8-GPU compatible.
+"""SMT (Sparse Matrix Tuning) with gradient-calibrated block selection.
 
-Uses same SparseLinear approach as SIFT for DeepSpeed compatibility.
-Instead of gradient-based submatrix selection, uses block-sparse random selection.
-Target trainable params: ~170M.
+Uses the same buffer + sparse delta approach as SIFT for DeepSpeed compatibility.
+Before fine-tuning, SMT runs a short calibration pass, scores 256x256 blocks by
+their accumulated weight-gradient magnitude, then trains only the selected blocks.
 """
+import heapq
 import logging
 import os
 import sys
@@ -13,12 +14,12 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
-RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+RAPA_HOME = os.environ.get("RAPA_HOME", "/home/mms/freeSoul/llm/rapa")
 
 BLOCK_DIM = 256  # SMT block dimension
 
@@ -26,7 +27,7 @@ BLOCK_DIM = 256  # SMT block dimension
 class BlockSparseLinear(nn.Module):
     """Linear with block-sparse trainable delta (SMT-style)."""
 
-    def __init__(self, orig_linear: nn.Linear, num_blocks: int, seed: int = 42):
+    def __init__(self, orig_linear: nn.Linear, selected_blocks):
         super().__init__()
         self.in_features = orig_linear.in_features
         self.out_features = orig_linear.out_features
@@ -37,33 +38,19 @@ class BlockSparseLinear(nn.Module):
         else:
             self.bias = None
 
-        # Select random blocks
-        rows = self.out_features // BLOCK_DIM
-        cols = self.in_features // BLOCK_DIM
-        total_blocks = rows * cols
-        num_blocks = min(num_blocks, total_blocks)
-
-        rng = torch.Generator()
-        rng.manual_seed(seed)
-        block_indices = torch.randperm(total_blocks, generator=rng)[:num_blocks]
-
-        # Convert block indices to (row_block, col_block)
-        row_blocks = block_indices // cols
-        col_blocks = block_indices % cols
-
-        # Flatten to element indices
         flat_indices = []
-        for rb, cb in zip(row_blocks.tolist(), col_blocks.tolist()):
+        for rb, cb in selected_blocks:
             r_start = rb * BLOCK_DIM
             c_start = cb * BLOCK_DIM
             for r in range(r_start, min(r_start + BLOCK_DIM, self.out_features)):
                 for c in range(c_start, min(c_start + BLOCK_DIM, self.in_features)):
                     flat_indices.append(r * self.in_features + c)
 
-        flat_idx = torch.tensor(flat_indices, dtype=torch.long)
+        flat_idx = torch.tensor(flat_indices, dtype=torch.long, device=self.weight.device)
         self.register_buffer("flat_idx", flat_idx)
         self.sparse_delta = nn.Parameter(
-            torch.zeros(len(flat_idx), dtype=self.weight.dtype), requires_grad=True
+            torch.zeros(len(flat_idx), dtype=self.weight.dtype, device=self.weight.device),
+            requires_grad=True,
         )
 
     def forward(self, x):
@@ -75,8 +62,32 @@ class BlockSparseLinear(nn.Module):
         return F.linear(x, self.weight + delta, self.bias)
 
 
+def find_target_linear_layers(model, target_modules):
+    return {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and any(t in name for t in target_modules)
+    }
+
+
+def compute_total_target_blocks(layers, target_params=170_000_000):
+    """Compute total number of BLOCK_DIM x BLOCK_DIM blocks needed to hit target_params."""
+    params_per_block = BLOCK_DIM * BLOCK_DIM
+    available_blocks = 0
+    for module in layers.values():
+        available_blocks += (module.out_features // BLOCK_DIM) * (module.in_features // BLOCK_DIM)
+
+    requested_blocks = max(1, target_params // params_per_block)
+    total_blocks = min(requested_blocks, available_blocks)
+    logger.info(
+        f"[SMT] target_layers={len(layers)}, selected_blocks={total_blocks:,}, "
+        f"available_blocks={available_blocks:,}, ~trainable_params={total_blocks * params_per_block:,}"
+    )
+    return total_blocks
+
+
 def compute_blocks_per_layer(model, target_params=170_000_000, target_modules=None):
-    """Compute how many BLOCK_DIM x BLOCK_DIM blocks per layer to hit target_params."""
+    """Backward-compatible estimate kept for old callers; SMT now selects blocks globally."""
     if target_modules is None:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     num_layers = sum(1 for n, _ in model.named_modules()
@@ -104,6 +115,129 @@ class TextDataset(TorchDataset):
     def __getitem__(self, i): return self.data[i]
 
 
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def accumulate_gradient_block_scores(
+    model,
+    layers,
+    train_dataset,
+    calibration_steps=100,
+    calibration_batch_size=1,
+):
+    """Score each candidate block by mean absolute gradient over calibration batches."""
+    device = next(model.parameters()).device
+    scores = {}
+    for name, module in layers.items():
+        row_blocks = module.out_features // BLOCK_DIM
+        col_blocks = module.in_features // BLOCK_DIM
+        if row_blocks > 0 and col_blocks > 0:
+            scores[name] = torch.zeros((row_blocks, col_blocks), dtype=torch.float32)
+
+    if not scores:
+        return scores, 0
+
+    for param in model.parameters():
+        param.requires_grad = False
+        param.grad = None
+    for name in scores:
+        layers[name].weight.requires_grad = True
+
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    model.train()
+
+    loader = DataLoader(
+        train_dataset,
+        batch_size=calibration_batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    completed_steps = 0
+    for step, batch in enumerate(loader, start=1):
+        if step > calibration_steps:
+            break
+
+        model.zero_grad(set_to_none=True)
+        outputs = model(**_move_batch_to_device(batch, device))
+        outputs.loss.backward()
+
+        for name, module in layers.items():
+            grad = module.weight.grad
+            if grad is None or name not in scores:
+                continue
+
+            row_blocks, col_blocks = scores[name].shape
+            trimmed = grad[: row_blocks * BLOCK_DIM, : col_blocks * BLOCK_DIM]
+            block_scores = (
+                trimmed.detach()
+                .abs()
+                .reshape(row_blocks, BLOCK_DIM, col_blocks, BLOCK_DIM)
+                .mean(dim=(1, 3))
+                .float()
+                .cpu()
+            )
+            scores[name].add_(block_scores)
+            module.weight.grad = None
+
+        completed_steps = step
+        if step == 1 or step % 10 == 0:
+            logger.info(f"[SMT] calibration_progress={step}/{calibration_steps}")
+
+    model.zero_grad(set_to_none=True)
+    for name in scores:
+        layers[name].weight.requires_grad = False
+
+    return scores, completed_steps
+
+
+def select_top_gradient_blocks(scores, total_blocks):
+    """Select global top-k blocks across all target layers."""
+    heap = []
+    for name, score in scores.items():
+        flat_scores = score.reshape(-1)
+        col_blocks = score.shape[1]
+        k = min(total_blocks, flat_scores.numel())
+        if k <= 0:
+            continue
+
+        values, indices = torch.topk(flat_scores, k=k)
+        for value, idx in zip(values.tolist(), indices.tolist()):
+            item = (float(value), name, int(idx))
+            if len(heap) < total_blocks:
+                heapq.heappush(heap, item)
+            elif value > heap[0][0]:
+                heapq.heapreplace(heap, item)
+
+    selected = {}
+    for _, name, idx in heap:
+        col_blocks = scores[name].shape[1]
+        rb = idx // col_blocks
+        cb = idx % col_blocks
+        selected.setdefault(name, []).append((rb, cb))
+    return selected
+
+
+def replace_with_block_sparse_linear(model, selected_blocks):
+    replacements = 0
+    for name, blocks in selected_blocks.items():
+        if not blocks:
+            continue
+
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        attr = parts[-1]
+        module = getattr(parent, attr)
+        if isinstance(module, nn.Linear):
+            setattr(parent, attr, BlockSparseLinear(module, blocks))
+            replacements += 1
+    return replacements
+
+
 def train_smt(
     model_name_or_path,
     dataset_path,
@@ -120,10 +254,20 @@ def train_smt(
     hf_token=None,
     seed=42,
     report_to="none",
+    smt_calibration_steps=None,
+    smt_calibration_batch_size=None,
     **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    target_modules = [
+        item.strip()
+        for item in os.environ.get("SMT_TARGET_MODULES", "q_proj,k_proj,v_proj,o_proj").split(",")
+        if item.strip()
+    ]
+    if smt_calibration_steps is None:
+        smt_calibration_steps = int(os.environ.get("SMT_CALIBRATION_STEPS", "100"))
+    if smt_calibration_batch_size is None:
+        smt_calibration_batch_size = int(os.environ.get("SMT_CALIBRATION_BATCH_SIZE", "1"))
 
     tok_kwargs = {"token": hf_token} if hf_token else {}
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
@@ -136,32 +280,67 @@ def train_smt(
         **tok_kwargs,
     )
 
+    with open(dataset_path) as f:
+        raw = json.load(f)
+    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+
     selection_start = time.time()
-    blocks_per_layer = compute_blocks_per_layer(model, target_params, target_modules)
+    if torch.cuda.is_available():
+        model.to(torch.device("cuda"))
+
+    target_layers = find_target_linear_layers(model, target_modules)
+    total_selected_blocks = compute_total_target_blocks(target_layers, target_params)
+
+    calibration_start = time.time()
+    logger.info(
+        f"[SMT] Starting gradient calibration: steps={smt_calibration_steps}, "
+        f"batch_size={smt_calibration_batch_size}, target_modules={target_modules}"
+    )
+    gradient_scores, completed_calibration_steps = accumulate_gradient_block_scores(
+        model=model,
+        layers=target_layers,
+        train_dataset=train_dataset,
+        calibration_steps=smt_calibration_steps,
+        calibration_batch_size=smt_calibration_batch_size,
+    )
+    calibration_seconds = time.time() - calibration_start
+    logger.info(
+        f"[SMT] calibration_seconds={calibration_seconds:.2f}, "
+        f"completed_steps={completed_calibration_steps}"
+    )
+    selected_blocks = select_top_gradient_blocks(gradient_scores, total_selected_blocks)
 
     for param in model.parameters():
         param.requires_grad = False
 
-    # Replace target Linear with BlockSparseLinear
-    replacements = 0
-    for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear) and any(t in name for t in target_modules):
-            parts = name.split(".")
-            parent = model
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            bsl = BlockSparseLinear(module, blocks_per_layer, seed=seed + replacements)
-            setattr(parent, parts[-1], bsl)
-            replacements += 1
+    replacements = replace_with_block_sparse_linear(model, selected_blocks)
+    selected_block_count = sum(len(blocks) for blocks in selected_blocks.values())
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    logger.info(f"[SMT] Replaced {replacements} layers, trainable={trainable:,}, total params={total:,}")
+    logger.info(
+        f"[SMT] Replaced {replacements} layers, selected_blocks={selected_block_count:,}, "
+        f"trainable={trainable:,}, total params={total:,}"
+    )
     logger.info(f"[SMT] weight_selection_seconds={time.time() - selection_start:.2f}")
 
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    with open(os.path.join(output_dir, "smt_selection_meta.json"), "w") as f:
+        json.dump(
+            {
+                "target_modules": target_modules,
+                "target_params": target_params,
+                "block_dim": BLOCK_DIM,
+                "requested_calibration_steps": smt_calibration_steps,
+                "completed_calibration_steps": completed_calibration_steps,
+                "calibration_batch_size": smt_calibration_batch_size,
+                "calibration_seconds": calibration_seconds,
+                "selected_blocks": selected_block_count,
+                "selected_layers": len(selected_blocks),
+                "trainable_params": trainable,
+            },
+            f,
+            indent=2,
+        )
 
     save_strategy = "no" if 0 < max_steps < 100 else "epoch"
     training_args = TrainingArguments(
@@ -193,7 +372,13 @@ def train_smt(
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     # Restore to clean nn.Linear for vLLM/HF loading
-    from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
+    try:
+        from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
+    except ImportError:
+        try:
+            from .sift_tuner import restore_linear_modules
+        except ImportError:
+            from sift_tuner import restore_linear_modules
     model = restore_linear_modules(model)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)

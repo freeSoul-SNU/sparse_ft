@@ -179,7 +179,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", required=True)
     p.add_argument("--method", required=True)
-    p.add_argument("--results_file", default="/home1/irteam/rapa/results/results.md")
+    p.add_argument("--results_file", default="/home/mms/freeSoul/llm/rapa/results/results.md")
     p.add_argument("--judge", default="gpt-4o-mini")
     p.add_argument("--openai_api_key", required=True)
     p.add_argument("--num_gpus", type=int, default=8)

@@ -6,11 +6,11 @@
 
 | Method | Paper/Repo | Sparsity Type | Description |
 |--------|-----------|---------------|-------------|
-| **SIFT** | [song-wx/SIFT](https://github.com/song-wx/SIFT) | Random element-wise | 랜덤 위치의 weight element를 학습. `SparseLinear` 모듈로 frozen weight에 sparse delta 추가 |
-| **SpiEL** | [ducdauge/sft-llm](https://github.com/ducdauge/sft-llm) + [AlanAnsell/peft](https://github.com/AlanAnsell/peft) | Scatter sparse | PEFT fork의 `SftConfig` 사용. Scatter 방식 sparse fine-tuning |
-| **SMT** | [HectorHHZ/Sparse_Matrix_Tuning](https://github.com/HectorHHZ/Sparse_Matrix_Tuning) | Block-sparse (256x256) | 256x256 block 단위로 랜덤 선택하여 학습 |
-| **S2FT** | [Infini-AI-Lab/S2FT](https://github.com/Infini-AI-Lab/S2FT) | Structured row | Weight matrix의 연속 row를 선택하여 학습 (structured sparsity) |
-| **LT-SFT** | [cambridgeltl/composable-sft](https://github.com/cambridgeltl/composable-sft) | Lottery ticket | Lottery Ticket 방식 랜덤 element 선택. SIFT와 유사하나 별도 seed |
+| **SIFT** | [song-wx/SIFT](https://github.com/song-wx/SIFT) | Gradient top-k element-wise | calibration gradient의 absolute value 상위 weight element를 선택하여 학습 |
+| **SpiEL** | [ducdauge/sft-llm](https://github.com/ducdauge/sft-llm) + [AlanAnsell/peft](https://github.com/AlanAnsell/peft) | Dynamic scatter sparse | RigL/SM3 기반 prune-regrow selection으로 sparse delta 위치를 재선택하며 학습 |
+| **SMT** | [HectorHHZ/Sparse_Matrix_Tuning](https://github.com/HectorHHZ/Sparse_Matrix_Tuning) | Block-sparse (256x256) | calibration gradient score 상위 256x256 block을 선택하여 학습 |
+| **S2FT** | [Infini-AI-Lab/S2FT](https://github.com/Infini-AI-Lab/S2FT) | Structured heads/channels | activation calibration으로 attention head와 FFN channel을 선택하고 coupled row/column을 학습 |
+| **LT-SFT** | [cambridgeltl/composable-sft](https://github.com/cambridgeltl/composable-sft) | Lottery ticket | dense mask-search 후 `|theta_search - theta_0|` 상위 element를 선택하여 sparse fine-tuning |
 
 모든 method에서 **~170M trainable parameters** (전체 7B 모델의 ~2.35%)를 사용합니다.
 
@@ -22,15 +22,15 @@ sparse_ft/
 │   ├── sift/         # SIFT - SparseLinear + index cache
 │   ├── spiel/        # SpiEL - AlanAnsell peft fork
 │   ├── smt/          # SMT - BlockSparseLinear
-│   ├── s2ft/         # S2FT - RowSparseLinear  
+│   ├── s2ft/         # S2FT - structured head/channel selection
 │   └── ltsft/        # LT-SFT - SparseLinear (lottery ticket)
 ├── pipeline/          # LMFlow 통합 파이프라인
 │   ├── __init__.py
 │   ├── sift_tuner.py  # SIFT: frozen weight(buffer) + sparse_delta(Parameter)
 │   ├── spiel_tuner.py # SpiEL: peft fork SftConfig + merge_and_unload
 │   ├── smt_tuner.py   # SMT: BlockSparseLinear (256x256 blocks)
-│   ├── s2ft_tuner.py  # S2FT: RowSparseLinear (contiguous rows)
-│   ├── ltsft_tuner.py # LT-SFT: SparseLinear (random elements)
+│   ├── s2ft_tuner.py  # S2FT: structured attention-head / FFN-channel selection
+│   ├── ltsft_tuner.py # LT-SFT: lottery-ticket diff top-k selection
 │   ├── train_method.py      # 통합 학습 entrypoint
 │   ├── eval_mtbench.py      # MT-Bench 평가 (vLLM + GPT-4o-mini judge)
 │   ├── eval_lmharness.py    # MMLU/CSR 평가 (lm-eval-harness + vLLM)
@@ -70,68 +70,40 @@ class SparseLinear(nn.Module):
 ## Setup
 
 ```bash
-# 1. 가상환경 (반드시 /home1/irteam에 생성 — OOM killed 방지)
-python -m venv /home1/irteam/rapa/.rapa
-source /home1/irteam/rapa/.rapa/bin/activate
-
-# 2. 의존성
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install transformers accelerate datasets peft trl deepspeed sentencepiece openai vllm evaluate lm-eval
-
-# 3. LMFlow clone
-cd /home1/irteam/rapa
-git clone https://github.com/OptimalScale/LMFlow.git
-
-# 4. sparse_ft 코드를 LMFlow에 연결
-cp -r sparse_ft/pipeline/* LMFlow/src/lmflow/pipeline/rapa/
-cp -r sparse_ft/configs/* LMFlow/configs/rapa/
-
-# 5. SpiEL peft fork의 linear_sd C extension 빌드
-cd methods/spiel/peft_sft/linear-sd
-python setup.py install
+# conda 환경, LMFlow, PEFT fork, sparse_ft 연결을 한 번에 설정
+cd /home/mms/freeSoul/llm/sparse_ft
+bash scripts/setup_conda_env.sh
 ```
 
 ## Running Experiments
 
 ### Smoke Test (각 method 동작 확인, 20 steps)
 ```bash
-cd /home1/irteam/rapa/LMFlow
+cd /home/mms/freeSoul/llm/sparse_ft
 
 # 개별 method
-bash scripts/rapa/smoke_test.sh sift
-bash scripts/rapa/smoke_test.sh spiel
-bash scripts/rapa/smoke_test.sh smt
-bash scripts/rapa/smoke_test.sh s2ft
-bash scripts/rapa/smoke_test.sh ltsft
+bash smoke_test.sh sift
+bash smoke_test.sh spiel
+bash smoke_test.sh smt
+bash smoke_test.sh s2ft
+bash smoke_test.sh ltsft
 ```
 
 ### Full Training + Evaluation
 ```bash
-# 전체 실험 (MT-Bench → MMLU → CSR), nohup으로 서버 끊겨도 유지
-cd /home1/irteam/rapa/LMFlow
-nohup bash scripts/rapa/run_all.sh > /home1/irteam/rapa/results/run_all.log 2>&1 &
+# 전체 실험 (MT-Bench → MMLU → CSR)
+cd /home/mms/freeSoul/llm/sparse_ft
+bash run_all.sh
 
 # 진행상황 확인
-tail -f /home1/irteam/rapa/results/run_all.log
+tail -f /home/mms/freeSoul/llm/rapa/results/results.md
 ```
 
 ### Individual Training
 ```bash
-# 단일 method 학습 (deepspeed 8 GPU)
-deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=29600 \
-    examples/rapa/train_method.py \
-    --method sift \
-    --model_name_or_path mistralai/Mistral-7B-v0.3 \
-    --dataset_path /home1/irteam/rapa/data/oasst1_lmflow.json \
-    --output_dir /home1/irteam/rapa/checkpoints/mtbench_sift \
-    --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
-    --learning_rate 5e-5 \
-    --lr_scheduler_type linear \
-    --max_seq_length 512 \
-    --target_params 170000000 \
-    --bf16 \
-    --hf_token YOUR_HF_TOKEN
+# GPU 작업은 스크립트가 srun으로 감싼 뒤 deepspeed를 실행한다.
+cd /home/mms/freeSoul/llm/sparse_ft
+METHODS=sift bash run_mmlu_20m_single_gpu.sh
 ```
 
 ## Hyperparameters
@@ -154,7 +126,7 @@ deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=29600 \
 | Param | Value |
 |-------|-------|
 | Model | `meta-llama/Llama-2-7b-hf` |
-| Dataset | `/home1/irteam/datasets/mmlu/mmlu.json`, `/home1/irteam/datasets/merge/merge.json` |
+| Dataset | `/home/mms/freeSoul/llm/rapa/OwLore_Dataset/mmlu/mmlu.json`, `CSR_DATASET` |
 | LR scheduler | cosine |
 | Learning rate | 5e-5 |
 | Epoch | 1 |
@@ -164,13 +136,13 @@ deepspeed --include=localhost:0,1,2,3,4,5,6,7 --master_port=29600 \
 ## SIFT Index Caching
 
 SIFT sparse index 생성은 7B 모델에서 시간이 걸립니다. 최초 1회 생성 후 `.pt` 파일로 캐시:
-- 캐시 위치: `/home1/irteam/rapa/checkpoints/.sift_idx_cache/`
+- 캐시 위치: `/home/mms/freeSoul/llm/rapa/checkpoints/.sift_idx_cache/`
 - 캐시 키: `hash(model_name + sparse_rate + modules + seed + dataset_name)`
 - 같은 모델 + 같은 설정이면 데이터셋이 달라도 `torch.load`로 즉시 로드
 
 ## Important Notes
 
-1. **OOM 방지**: 모든 데이터(모델, 캐시, 체크포인트)를 `/home1/irteam/rapa/`에 저장
-2. **8 GPU 필수**: DeepSpeed ZeRO-1으로 8 GPU 학습, vLLM tensor_parallel로 8 GPU 평가
+1. **OOM 방지**: 모든 데이터(모델, 캐시, 체크포인트)를 `/home/mms/freeSoul/llm/rapa/`에 저장
+2. **GPU 사용**: 서버 정책에 맞춰 `srun -A mms -p gpu_default --gres=gpu:N`으로 실행하며 `NUM_GPUS`는 1 또는 2만 사용
 3. **DeepSpeed config**: `ds_zero1_sift.json`에 optimizer + scheduler 명시 필요 (frozen params와의 호환성)
 4. **SpiEL fork**: `AlanAnsell/peft` fork 필요, `linear_sd` C extension 빌드 필수

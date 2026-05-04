@@ -1,30 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RAPA_HOME="${RAPA_HOME:-/home1/irteam/rapa}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="${REPO_ROOT}/scripts/$(basename "${BASH_SOURCE[0]}")"
+source "${REPO_ROOT}/scripts/env_utils.sh"
+
+NUM_GPUS="${NUM_GPUS:-1}"
+if [ "${NUM_GPUS}" != "1" ]; then
+    echo "$(basename "${SCRIPT_PATH}") profiles one GPU; use NUM_GPUS=1." >&2
+    exit 1
+fi
+SLURM_TIME="${SLURM_TIME:-auto}"
+maybe_reexec_with_srun "${SCRIPT_PATH}" "$@"
+
+ENV_NAME="${ENV_NAME:-rapa_h200}"
+LLM_ROOT="${LLM_ROOT:-$(cd "${REPO_ROOT}/.." && pwd)}"
+RAPA_HOME="${RAPA_HOME:-${LLM_ROOT}/rapa}"
 LMFLOW_DIR="${LMFLOW_DIR:-${RAPA_HOME}/LMFlow}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py}"
 RESULT_ROOT="${RESULT_ROOT:-${RAPA_HOME}/profiling}"
 LOG_ROOT="${LOG_ROOT:-${RESULT_ROOT}/logs}"
 CSV_PATH="${CSV_PATH:-${RESULT_ROOT}/train_profile_gpu0.csv}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${RAPA_HOME}/conda_envs/${ENV_NAME}}"
 GPU_INDEX="${GPU_INDEX:-0}"
 METHODS="${METHODS:-sift spiel smt s2ft ltsft}"
 MAX_STEPS="${MAX_STEPS:-}"
+MMLU_DATASET="${MMLU_DATASET:-${RAPA_HOME}/OwLore_Dataset/mmlu/mmlu.json}"
+CSR_DATASET="${CSR_DATASET:-${RAPA_HOME}/OwLore_Dataset/merge/merge.json}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p "${RESULT_ROOT}" "${LOG_ROOT}"
+
+activate_sparse_ft_conda
+configure_cuda_env
 
 export HF_HOME="${HF_HOME:-${RAPA_HOME}/hf_cache}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES="${GPU_INDEX}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_INDEX}}"
+export RAPA_HOME
+export SPARSE_FT_ROOT="${REPO_ROOT}"
+export PEFT_DIR="${PEFT_DIR:-${RAPA_HOME}/peft}"
+export PYTHONPATH="${LMFLOW_DIR}/src:${REPO_ROOT}:${PYTHONPATH:-}"
+export DS_CONFIG="${DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
+NVIDIA_SMI_GPU_ID="${NVIDIA_SMI_GPU_ID:-${CUDA_VISIBLE_DEVICES%%,*}}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "nvidia-smi command was not found."
     exit 1
 fi
+
+mkdir -p "${LMFLOW_DIR}/src/lmflow/pipeline/rapa" "${LMFLOW_DIR}/configs/rapa"
+cp -r "${REPO_ROOT}/pipeline/." "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/"
+cp -r "${REPO_ROOT}/configs/." "${LMFLOW_DIR}/configs/rapa/"
 
 if [ ! -f "${TRAIN_SCRIPT}" ]; then
     echo "Training entrypoint not found: ${TRAIN_SCRIPT}"
@@ -45,7 +75,7 @@ monitor_gpu_memory() {
     local out_file=$1
     : > "${out_file}"
     while true; do
-        nvidia-smi --id="${GPU_INDEX}" \
+        nvidia-smi --id="${NVIDIA_SMI_GPU_ID}" \
             --query-gpu=timestamp,memory.used,utilization.gpu \
             --format=csv,noheader,nounits >> "${out_file}"
         sleep 1
@@ -73,6 +103,11 @@ run_profile() {
     local peak_mem
     local exit_code
     local extra_args=()
+
+    if [ ! -f "${dataset}" ]; then
+        echo "[${task}] dataset not found, skipping ${method}: ${dataset}"
+        return 0
+    fi
 
     mkdir -p "${output_dir}" "${log_dir}"
     master_port=$((29500 + RANDOM % 1000))
@@ -130,7 +165,7 @@ for method in ${METHODS}; do
         "mmlu" \
         "${method}" \
         "meta-llama/Llama-2-7b-hf" \
-        "/home1/irteam/datasets/mmlu/mmlu.json" \
+        "${MMLU_DATASET}" \
         "cosine" \
         "1" \
         "512"
@@ -141,7 +176,7 @@ for method in ${METHODS}; do
         "csr" \
         "${method}" \
         "meta-llama/Llama-2-7b-hf" \
-        "/home1/irteam/datasets/merge/merge.json" \
+        "${CSR_DATASET}" \
         "cosine" \
         "1" \
         "512"

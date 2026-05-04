@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -44,7 +45,7 @@ def run_eval(model_path, task, num_fewshot, num_gpus=8):
 
     if result.returncode != 0:
         logger.error(f"lm_eval failed:\n{result.stderr[-2000:]}")
-        return None, elapsed
+        return None, elapsed, result.returncode
 
     # Parse results
     logger.info(f"lm_eval completed in {elapsed:.0f}s")
@@ -100,7 +101,7 @@ def run_eval(model_path, task, num_fewshot, num_gpus=8):
                     except (ValueError, IndexError):
                         pass
 
-    return scores, elapsed
+    return scores, elapsed, 0
 
 
 def append_results(results_file, method, task, scores, elapsed):
@@ -141,16 +142,17 @@ def main():
     p.add_argument("--method", required=True)
     p.add_argument("--task", required=True, choices=["mmlu", "csr"])
     p.add_argument("--num_fewshot", type=int, default=0)
-    p.add_argument("--results_file", default="/home1/irteam/rapa/results/results.md")
+    p.add_argument("--results_file", default="/home/mms/freeSoul/llm/rapa/results/results.md")
     p.add_argument("--num_gpus", type=int, default=8)
     args = p.parse_args()
 
-    scores, elapsed = run_eval(args.model_path, args.task, args.num_fewshot, args.num_gpus)
+    scores, elapsed, returncode = run_eval(args.model_path, args.task, args.num_fewshot, args.num_gpus)
     if scores:
         append_results(args.results_file, args.method, args.task, scores, elapsed)
         logger.info(f"[{args.method}] {args.task} scores: {scores}")
     else:
         logger.error(f"[{args.method}] {args.task} evaluation failed")
+        sys.exit(returncode or 1)
 
 
 if __name__ == "__main__":

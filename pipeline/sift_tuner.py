@@ -10,53 +10,37 @@ This works natively with DeepSpeed ZeRO-1: only sparse_delta params are optimize
 """
 import logging
 import os
-import sys
 import json
 import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 
-SPARSE_FT_ROOT = os.environ.get(
-    "SPARSE_FT_ROOT",
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-)
-RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
-SIFT_PATH = os.environ.get("SIFT_PATH", os.path.join(SPARSE_FT_ROOT, "methods", "sift"))
-if SIFT_PATH not in sys.path:
-    sys.path.insert(0, SIFT_PATH)
-
-from sift import SIFT  # noqa: E402
+RAPA_HOME = os.environ.get("RAPA_HOME", "/home/mms/freeSoul/llm/rapa")
 
 
 def restore_linear_modules(model):
-    """Replace all SparseLinear/BlockSparseLinear/RowSparseLinear back to nn.Linear for clean saving."""
+    """Replace SparseLinear/BlockSparseLinear modules back to nn.Linear for clean saving."""
     sparse_types = (SparseLinear,)
     # Import other sparse types if available
     try:
         from lmflow.pipeline.rapa.smt_tuner import BlockSparseLinear
     except ImportError:
         try:
-            from smt_tuner import BlockSparseLinear
+            from .smt_tuner import BlockSparseLinear
         except ImportError:
-            BlockSparseLinear = None
+            try:
+                from smt_tuner import BlockSparseLinear
+            except ImportError:
+                BlockSparseLinear = None
     if BlockSparseLinear is not None:
         sparse_types = sparse_types + (BlockSparseLinear,)
-    try:
-        from lmflow.pipeline.rapa.s2ft_tuner import RowSparseLinear
-    except ImportError:
-        try:
-            from s2ft_tuner import RowSparseLinear
-        except ImportError:
-            RowSparseLinear = None
-    if RowSparseLinear is not None:
-        sparse_types = sparse_types + (RowSparseLinear,)
 
     for name, module in list(model.named_modules()):
         if isinstance(module, sparse_types):
@@ -109,9 +93,10 @@ class SparseLinear(nn.Module):
             self.bias = None
 
         # Sparse trainable delta — the ONLY parameter DeepSpeed optimizes
-        self.register_buffer("flat_idx", flat_idx)
+        self.register_buffer("flat_idx", flat_idx.to(device=self.weight.device, dtype=torch.long))
         self.sparse_delta = nn.Parameter(
-            torch.zeros(len(flat_idx), dtype=self.weight.dtype), requires_grad=True
+            torch.zeros(len(flat_idx), dtype=self.weight.dtype, device=self.weight.device),
+            requires_grad=True,
         )
 
     def forward(self, x):
@@ -204,6 +189,72 @@ class TextDataset(TorchDataset):
         return self.data[i]
 
 
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def select_sift_gradient_indices(
+    model,
+    train_dataset,
+    sparse_rate,
+    sparse_modules,
+    calibration_steps=1,
+    calibration_batch_size=1,
+):
+    """Select SIFT indices by first-batch/few-batch absolute gradient top-k."""
+    device = next(model.parameters()).device
+    target_params = {
+        name: param
+        for name, param in model.named_parameters()
+        if param.ndim == 2 and any(module in name for module in sparse_modules)
+    }
+    scores = {}
+
+    for param in model.parameters():
+        param.requires_grad = False
+        param.grad = None
+    for param in target_params.values():
+        param.requires_grad = True
+
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    model.train()
+
+    loader = DataLoader(train_dataset, batch_size=calibration_batch_size, shuffle=False, num_workers=0)
+    completed_steps = 0
+    for step, batch in enumerate(loader, start=1):
+        if step > calibration_steps:
+            break
+
+        model.zero_grad(set_to_none=True)
+        outputs = model(**_move_batch_to_device(batch, device))
+        outputs.loss.backward()
+
+        for name, param in target_params.items():
+            if param.grad is None:
+                continue
+            grad_score = param.grad.detach().abs().float().cpu()
+            if name in scores:
+                scores[name].add_(grad_score)
+            else:
+                scores[name] = grad_score
+            param.grad = None
+
+        completed_steps = step
+        logger.info(f"[SIFT] calibration_progress={step}/{calibration_steps}")
+
+    sparse_indices = {}
+    for name, score in scores.items():
+        train_num = min(max(1, int(sparse_rate * score.numel()) + 1), score.numel())
+        flat_idx = torch.topk(score.reshape(-1), k=train_num, largest=True, sorted=False).indices.cpu()
+        sparse_indices[name] = flat_idx
+
+    model.zero_grad(set_to_none=True)
+    for param in target_params.values():
+        param.requires_grad = False
+    return sparse_indices, completed_steps
+
+
 def train_sift(
     model_name_or_path,
     dataset_path,
@@ -221,6 +272,8 @@ def train_sift(
     hf_token=None,
     seed=42,
     report_to="none",
+    sift_calibration_steps=None,
+    sift_calibration_batch_size=None,
     **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -239,37 +292,46 @@ def train_sift(
         **tok_kwargs,
     )
 
+    with open(dataset_path) as f:
+        raw = json.load(f)
+    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+
     selection_start = time.time()
     sparse_rate = compute_sparse_rate(model, target_params=target_params, sparse_modules=sparse_modules)
+    if sift_calibration_steps is None:
+        sift_calibration_steps = int(os.environ.get("SIFT_CALIBRATION_STEPS", "1"))
+    if sift_calibration_batch_size is None:
+        sift_calibration_batch_size = int(os.environ.get("SIFT_CALIBRATION_BATCH_SIZE", "1"))
+    if torch.cuda.is_available():
+        model.to(torch.device("cuda"))
 
-    dataset_tag = os.path.basename(dataset_path).replace(".json", "")
-    sift_obj = SIFT(
-        model=model,
-        sparse_rate=sparse_rate,
-        sparse_module=sparse_modules,
-        grad_acc=gradient_accumulation_steps,
-        model_name=model_name_or_path,
-        seed=seed,
-        dataset_name=dataset_tag,
+    logger.info(
+        f"[SIFT] Starting gradient selection: steps={sift_calibration_steps}, "
+        f"batch_size={sift_calibration_batch_size}"
     )
-    sift_obj.print_trainable_parameters()
+    sparse_indices, completed_calibration_steps = select_sift_gradient_indices(
+        model=model,
+        train_dataset=train_dataset,
+        sparse_rate=sparse_rate,
+        sparse_modules=sparse_modules,
+        calibration_steps=sift_calibration_steps,
+        calibration_batch_size=sift_calibration_batch_size,
+    )
 
     for param in model.parameters():
         param.requires_grad = False
 
     # Replace target Linear with SparseLinear
-    model = replace_with_sparse_linear(model, sift_obj, sparse_modules)
+    sparse_holder = type("SiftSelection", (), {"sparse_indices": sparse_indices})()
+    model = replace_with_sparse_linear(model, sparse_holder, sparse_modules)
     selection_elapsed = time.time() - selection_start
 
     # Verify trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"[SIFT] After replacement: trainable={trainable:,}, total={total:,}")
+    logger.info(f"[SIFT] completed_calibration_steps={completed_calibration_steps}")
     logger.info(f"[SIFT] weight_selection_seconds={selection_elapsed:.2f}")
-
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
 
     save_strategy = "no" if 0 < max_steps < 100 else "epoch"
     training_args = TrainingArguments(

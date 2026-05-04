@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SPARSE_FT_ROOT="${SPARSE_FT_ROOT:-/data/nksol0405/LLM/sparse_ft}"
-RESULT_ROOT="${RESULT_ROOT:-/data/nksol0405/LLM/rapa/sparse_ft_20m_mmlu_single_gpu}"
+SPARSE_FT_ROOT="${SPARSE_FT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LLM_ROOT="${LLM_ROOT:-$(cd "${SPARSE_FT_ROOT}/.." && pwd)}"
+RAPA_HOME="${RAPA_HOME:-${LLM_ROOT}/rapa}"
+RESULT_ROOT="${RESULT_ROOT:-${RAPA_HOME}/sparse_ft_20m_mmlu_single_gpu}"
 SOURCE_SESSION="${SOURCE_SESSION:-sparse_ft_mmlu_20m}"
 NEXT_SESSION="${NEXT_SESSION:-sparse_ft_mmlu_20m_batch8}"
 RUN_LOG="${RUN_LOG:-${RESULT_ROOT}/run.log}"
