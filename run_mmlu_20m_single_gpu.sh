@@ -53,12 +53,16 @@ SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
 SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
 S2FT_CALIBRATION_STEPS="${S2FT_CALIBRATION_STEPS:-100}"
 S2FT_CALIBRATION_BATCH_SIZE="${S2FT_CALIBRATION_BATCH_SIZE:-1}"
+S2FT_RATIO_PRESET="${S2FT_RATIO_PRESET:-budget}"
+S2FT_LAYER_ALLOCATION="${S2FT_LAYER_ALLOCATION:-uniform}"
 LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
+RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
 export SIFT_CALIBRATION_STEPS SIFT_CALIBRATION_BATCH_SIZE
 export RESUME_TRAINING SIFT_USE_GRADIENT_CALIBRATION SIFT_CALIBRATION_ONLY
 export SMT_CALIBRATION_STEPS SMT_CALIBRATION_BATCH_SIZE
 export S2FT_CALIBRATION_STEPS S2FT_CALIBRATION_BATCH_SIZE
+export S2FT_RATIO_PRESET S2FT_LAYER_ALLOCATION RAPA_DATALOADER_NUM_WORKERS
 export LTSFT_MASK_SEARCH_STEPS LTSFT_N_FT_ITERATIONS
 
 if [ ! -f "${DATASET}" ]; then
@@ -142,6 +146,8 @@ if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS_FILE}" ]; then
         echo "- sift_calibration_steps: ${SIFT_CALIBRATION_STEPS}"
         echo "- smt_calibration_steps: ${SMT_CALIBRATION_STEPS}"
         echo "- s2ft_calibration_steps: ${S2FT_CALIBRATION_STEPS}"
+        echo "- s2ft_ratio_preset: ${S2FT_RATIO_PRESET}"
+        echo "- s2ft_layer_allocation: ${S2FT_LAYER_ALLOCATION}"
         echo "- ltsft_mask_search_steps: ${LTSFT_MASK_SEARCH_STEPS}"
         echo "- ltsft_n_ft_iterations: ${LTSFT_N_FT_ITERATIONS}"
         echo "- smt_calibration_batch_size: ${SMT_CALIBRATION_BATCH_SIZE}"
@@ -164,6 +170,8 @@ else
         echo "- sift_calibration_steps: ${SIFT_CALIBRATION_STEPS}"
         echo "- smt_calibration_steps: ${SMT_CALIBRATION_STEPS}"
         echo "- s2ft_calibration_steps: ${S2FT_CALIBRATION_STEPS}"
+        echo "- s2ft_ratio_preset: ${S2FT_RATIO_PRESET}"
+        echo "- s2ft_layer_allocation: ${S2FT_LAYER_ALLOCATION}"
         echo "- ltsft_mask_search_steps: ${LTSFT_MASK_SEARCH_STEPS}"
         echo "- ltsft_n_ft_iterations: ${LTSFT_N_FT_ITERATIONS}"
         echo "- smt_calibration_batch_size: ${SMT_CALIBRATION_BATCH_SIZE}"
@@ -172,7 +180,7 @@ else
 fi
 
 if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${METRICS_FILE}" ]; then
-    echo -e "method\tphase\telapsed_seconds\tpeak_memory_mb\tpeak_cpu_rss_mb\tbatch_size\tgradient_accumulation_steps\texit_code" > "${METRICS_FILE}"
+    echo -e "method\tphase\telapsed_seconds\tpeak_memory_mb\tpeak_cpu_pss_mb\tpeak_cpu_rss_sum_mb\tpeak_cpu_rss_max_mb\tpeak_system_mem_delta_mb\tbatch_size\tgradient_accumulation_steps\texit_code" > "${METRICS_FILE}"
 fi
 
 log_metric_value() {
@@ -230,19 +238,44 @@ job_gpu_used_mb() {
         '
 }
 
-job_cpu_rss_mb() {
-    local root_pid="$1"
-    local pids csv
-
-    pids="$(descendant_pids "${root_pid}")"
-    csv="$(echo "${pids}" | tr ' ' ',')"
-    ps -o rss= -p "${csv}" 2>/dev/null | awk 'BEGIN{s=0} {s+=$1} END{print int(s/1024)}'
+marker_pids() {
+    local marker="$1"
+    ps -eo pid=,args= 2>/dev/null \
+        | awk -v marker="${marker}" 'index($0, marker) > 0 && index($0, "awk -v marker=") == 0 {print $1}'
 }
 
-marker_cpu_rss_mb() {
-    local marker="$1"
-    ps -eo rss=,args= 2>/dev/null \
-        | awk -v marker="${marker}" 'index($0, marker) > 0 {sum += $1} END {print int(sum / 1024)}'
+related_pids() {
+    local root_pid="$1"
+    local marker="${2:-}"
+    {
+        descendant_pids "${root_pid}" | tr ' ' '\n'
+        if [ -n "${marker}" ]; then
+            marker_pids "${marker}"
+        fi
+    } | awk '/^[0-9]+$/ && !seen[$1]++ {print $1}'
+}
+
+cpu_stats_mb() {
+    local root_pid="$1"
+    local marker="${2:-}"
+    related_pids "${root_pid}" "${marker}" | while read -r pid; do
+        [ -r "/proc/${pid}/status" ] || continue
+        rss_kb="$(awk '/^VmRSS:/ {print int($2); found=1} END{if(!found) print 0}' "/proc/${pid}/status" 2>/dev/null || echo 0)"
+        pss_kb="$(awk '/^Pss:/ {print int($2); found=1; exit} END{if(!found) print 0}' "/proc/${pid}/smaps_rollup" 2>/dev/null || echo 0)"
+        printf '%s %s\n' "${rss_kb}" "${pss_kb}"
+    done | awk '
+        BEGIN {rss_sum=0; rss_max=0; pss_sum=0}
+        {
+            rss_sum += $1;
+            if ($1 > rss_max) rss_max = $1;
+            pss_sum += $2;
+        }
+        END {printf "%d %d %d", int(rss_sum/1024), int(rss_max/1024), int(pss_sum/1024)}
+    '
+}
+
+system_used_mem_mb() {
+    awk '/^MemTotal:/ {total=$2} /^MemAvailable:/ {available=$2} END {print int((total - available) / 1024)}' /proc/meminfo
 }
 
 start_gpu_monitor() {
@@ -254,58 +287,87 @@ start_gpu_monitor() {
     local start_ts="${6:-$(date +%s)}"
     local root_pid="${7:-$$}"
     local marker="${8:-}"
-    local cpu_peak_file="${peak_file%.txt}_cpu_rss_mb.txt"
+    local cpu_pss_peak_file="${peak_file%.txt}_cpu_pss_mb.txt"
+    local cpu_rss_sum_peak_file="${peak_file%.txt}_cpu_rss_sum_mb.txt"
+    local cpu_rss_max_peak_file="${peak_file%.txt}_cpu_rss_max_mb.txt"
+    local system_delta_peak_file="${peak_file%.txt}_system_mem_delta_mb.txt"
+    local baseline_system_used
+    baseline_system_used="$(system_used_mem_mb)"
     rm -f "${stop_file}"
     echo "0" > "${peak_file}"
-    echo "0" > "${cpu_peak_file}"
+    echo "0" > "${cpu_pss_peak_file}"
+    echo "0" > "${cpu_rss_sum_peak_file}"
+    echo "0" > "${cpu_rss_max_peak_file}"
+    echo "0" > "${system_delta_peak_file}"
     (
         peak=0
-        cpu_peak=0
+        cpu_pss_peak=0
+        cpu_rss_sum_peak=0
+        cpu_rss_max_peak=0
+        system_delta_peak=0
         last_log=0
         while [ ! -f "${stop_file}" ]; do
             mem="$(gpu_used_mb)"
-            cpu_mem="$(job_cpu_rss_mb "${root_pid}")"
-            marker_cpu=0
-            if [ -n "${marker}" ]; then
-                marker_cpu="$(marker_cpu_rss_mb "${marker}")"
-            fi
-            if [ "${marker_cpu}" -gt "${cpu_mem}" ]; then
-                cpu_mem="${marker_cpu}"
+            read -r cpu_rss_sum cpu_rss_max cpu_pss < <(cpu_stats_mb "${root_pid}" "${marker}")
+            system_delta=$(( $(system_used_mem_mb) - baseline_system_used ))
+            if [ "${system_delta}" -lt 0 ]; then
+                system_delta=0
             fi
             if [ "${mem}" -gt "${peak}" ]; then
                 peak="${mem}"
                 echo "${peak}" > "${peak_file}"
             fi
-            if [ "${cpu_mem}" -gt "${cpu_peak}" ]; then
-                cpu_peak="${cpu_mem}"
-                echo "${cpu_peak}" > "${cpu_peak_file}"
+            if [ "${cpu_pss}" -gt "${cpu_pss_peak}" ]; then
+                cpu_pss_peak="${cpu_pss}"
+                echo "${cpu_pss_peak}" > "${cpu_pss_peak_file}"
+            fi
+            if [ "${cpu_rss_sum}" -gt "${cpu_rss_sum_peak}" ]; then
+                cpu_rss_sum_peak="${cpu_rss_sum}"
+                echo "${cpu_rss_sum_peak}" > "${cpu_rss_sum_peak_file}"
+            fi
+            if [ "${cpu_rss_max}" -gt "${cpu_rss_max_peak}" ]; then
+                cpu_rss_max_peak="${cpu_rss_max}"
+                echo "${cpu_rss_max_peak}" > "${cpu_rss_max_peak_file}"
+            fi
+            if [ "${system_delta}" -gt "${system_delta_peak}" ]; then
+                system_delta_peak="${system_delta}"
+                echo "${system_delta_peak}" > "${system_delta_peak_file}"
             fi
             now="$(date +%s)"
             if [ -n "${status_log}" ] && [ $((now - last_log)) -ge "${GPU_MONITOR_LOG_INTERVAL}" ]; then
                 elapsed=$((now - start_ts))
                 job_mem="$(job_gpu_used_mb "${root_pid}")"
-                echo "[mmlu] ${method} ${phase} status elapsed_seconds=${elapsed} gpu_memory_mb=${mem} job_gpu_memory_mb=${job_mem} peak_memory_mb=${peak} cpu_rss_mb=${cpu_mem} peak_cpu_rss_mb=${cpu_peak}" | tee -a "${status_log}"
+                echo "[mmlu] ${method} ${phase} status elapsed_seconds=${elapsed} gpu_memory_mb=${mem} job_gpu_memory_mb=${job_mem} peak_memory_mb=${peak} cpu_pss_mb=${cpu_pss} peak_cpu_pss_mb=${cpu_pss_peak} cpu_rss_sum_mb=${cpu_rss_sum} peak_cpu_rss_sum_mb=${cpu_rss_sum_peak} cpu_rss_max_mb=${cpu_rss_max} peak_cpu_rss_max_mb=${cpu_rss_max_peak} system_mem_delta_mb=${system_delta} peak_system_mem_delta_mb=${system_delta_peak}" | tee -a "${status_log}"
                 last_log="${now}"
             fi
             sleep "${GPU_MONITOR_INTERVAL}"
         done
         mem="$(gpu_used_mb)"
-        cpu_mem="$(job_cpu_rss_mb "${root_pid}")"
-        marker_cpu=0
-        if [ -n "${marker}" ]; then
-            marker_cpu="$(marker_cpu_rss_mb "${marker}")"
-        fi
-        if [ "${marker_cpu}" -gt "${cpu_mem}" ]; then
-            cpu_mem="${marker_cpu}"
+        read -r cpu_rss_sum cpu_rss_max cpu_pss < <(cpu_stats_mb "${root_pid}" "${marker}")
+        system_delta=$(( $(system_used_mem_mb) - baseline_system_used ))
+        if [ "${system_delta}" -lt 0 ]; then
+            system_delta=0
         fi
         if [ "${mem}" -gt "${peak}" ]; then
             peak="${mem}"
         fi
-        if [ "${cpu_mem}" -gt "${cpu_peak}" ]; then
-            cpu_peak="${cpu_mem}"
+        if [ "${cpu_pss}" -gt "${cpu_pss_peak}" ]; then
+            cpu_pss_peak="${cpu_pss}"
+        fi
+        if [ "${cpu_rss_sum}" -gt "${cpu_rss_sum_peak}" ]; then
+            cpu_rss_sum_peak="${cpu_rss_sum}"
+        fi
+        if [ "${cpu_rss_max}" -gt "${cpu_rss_max_peak}" ]; then
+            cpu_rss_max_peak="${cpu_rss_max}"
+        fi
+        if [ "${system_delta}" -gt "${system_delta_peak}" ]; then
+            system_delta_peak="${system_delta}"
         fi
         echo "${peak}" > "${peak_file}"
-        echo "${cpu_peak}" > "${cpu_peak_file}"
+        echo "${cpu_pss_peak}" > "${cpu_pss_peak_file}"
+        echo "${cpu_rss_sum_peak}" > "${cpu_rss_sum_peak_file}"
+        echo "${cpu_rss_max_peak}" > "${cpu_rss_max_peak_file}"
+        echo "${system_delta_peak}" > "${system_delta_peak_file}"
     ) &
     GPU_MONITOR_PID="$!"
 }
@@ -318,9 +380,24 @@ stop_gpu_monitor() {
     cat "${peak_file}"
 }
 
-cpu_peak_file_for() {
+cpu_pss_peak_file_for() {
     local peak_file="$1"
-    echo "${peak_file%.txt}_cpu_rss_mb.txt"
+    echo "${peak_file%.txt}_cpu_pss_mb.txt"
+}
+
+cpu_rss_sum_peak_file_for() {
+    local peak_file="$1"
+    echo "${peak_file%.txt}_cpu_rss_sum_mb.txt"
+}
+
+cpu_rss_max_peak_file_for() {
+    local peak_file="$1"
+    echo "${peak_file%.txt}_cpu_rss_max_mb.txt"
+}
+
+system_delta_peak_file_for() {
+    local peak_file="$1"
+    echo "${peak_file%.txt}_system_mem_delta_mb.txt"
 }
 
 cd "${LMFLOW_DIR}"
@@ -386,10 +463,12 @@ for method in ${METHODS}; do
 
         train_elapsed=$(( $(date +%s) - train_start ))
         train_peak_mb="$(stop_gpu_monitor "${train_peak_file}" "${train_stop_file}")"
-        train_cpu_peak_file="$(cpu_peak_file_for "${train_peak_file}")"
-        train_peak_cpu_mb="$(cat "${train_cpu_peak_file}" 2>/dev/null || echo 0)"
-        echo "[mmlu] ${method} train elapsed_seconds=${train_elapsed} peak_memory_mb=${train_peak_mb} peak_cpu_rss_mb=${train_peak_cpu_mb} exit=${train_ec}" | tee -a "${log_dir}/train.log"
-        echo -e "${method}\ttrain\t${train_elapsed}\t${train_peak_mb}\t${train_peak_cpu_mb}\t${BATCH_SIZE}\t${GRAD_ACCUM}\t${train_ec}" >> "${METRICS_FILE}"
+        train_peak_cpu_pss_mb="$(cat "$(cpu_pss_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
+        train_peak_cpu_rss_sum_mb="$(cat "$(cpu_rss_sum_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
+        train_peak_cpu_rss_max_mb="$(cat "$(cpu_rss_max_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
+        train_peak_system_delta_mb="$(cat "$(system_delta_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
+        echo "[mmlu] ${method} train elapsed_seconds=${train_elapsed} peak_memory_mb=${train_peak_mb} peak_cpu_pss_mb=${train_peak_cpu_pss_mb} peak_cpu_rss_sum_mb=${train_peak_cpu_rss_sum_mb} peak_cpu_rss_max_mb=${train_peak_cpu_rss_max_mb} peak_system_mem_delta_mb=${train_peak_system_delta_mb} exit=${train_ec}" | tee -a "${log_dir}/train.log"
+        echo -e "${method}\ttrain\t${train_elapsed}\t${train_peak_mb}\t${train_peak_cpu_pss_mb}\t${train_peak_cpu_rss_sum_mb}\t${train_peak_cpu_rss_max_mb}\t${train_peak_system_delta_mb}\t${BATCH_SIZE}\t${GRAD_ACCUM}\t${train_ec}" >> "${METRICS_FILE}"
         if [ "${method}" = "sift" ]; then
             calibration_elapsed="$(log_metric_value "${log_dir}/train.log" "calibration_seconds" || true)"
             calibration_peak_gpu="$(log_metric_value "${log_dir}/train.log" "calibration_peak_reserved_mb" || true)"

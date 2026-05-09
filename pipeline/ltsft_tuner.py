@@ -11,6 +11,7 @@ import os
 import json
 import time
 import gc
+import threading
 
 import torch
 import torch.nn as nn
@@ -30,11 +31,67 @@ except ImportError:
         from sift_tuner import SparseLinear, restore_linear_modules
 
 
+def _read_self_rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _read_self_pss_mb():
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+class _PhaseMemoryMonitor:
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.peak_rss_mb = 0
+        self.peak_pss_mb = 0
+        self._thread = None
+
+    def _sample(self):
+        self.peak_rss_mb = max(self.peak_rss_mb, _read_self_rss_mb())
+        self.peak_pss_mb = max(self.peak_pss_mb, _read_self_pss_mb())
+
+    def start(self):
+        self._sample()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def stop(self):
+        self._sample()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        return self
+
+
 def _deepspeed_config(default_path):
     value = os.environ.get("DS_CONFIG", default_path)
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
+
+
+def _dataloader_num_workers():
+    return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
 
 
 class TextDataset(TorchDataset):
@@ -328,7 +385,7 @@ def train_ltsft(
             logging_steps=5,
             report_to=report_to,
             seed=seed,
-            dataloader_num_workers=4,
+            dataloader_num_workers=_dataloader_num_workers(),
             remove_unused_columns=False,
             deepspeed=ds_config,
         )
@@ -384,7 +441,7 @@ def train_ltsft(
             logging_steps=5,
             report_to=report_to,
             seed=seed,
-            dataloader_num_workers=4,
+            dataloader_num_workers=_dataloader_num_workers(),
             remove_unused_columns=False,
             deepspeed=ds_config,
         )
@@ -395,7 +452,23 @@ def train_ltsft(
             tokenizer=tokenizer,
         )
         resume_checkpoint = get_last_checkpoint(output_dir) if iteration == 0 else None
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        sparse_train_start = time.time()
+        sparse_monitor = _PhaseMemoryMonitor().start()
         trainer.train(resume_from_checkpoint=resume_checkpoint)
+        sparse_monitor.stop()
+        sparse_train_seconds = time.time() - sparse_train_start
+        sparse_peak_allocated_mb = 0
+        sparse_peak_reserved_mb = 0
+        if torch.cuda.is_available():
+            sparse_peak_allocated_mb = int(torch.cuda.max_memory_allocated() / 1024 / 1024)
+            sparse_peak_reserved_mb = int(torch.cuda.max_memory_reserved() / 1024 / 1024)
+        logger.info(f"[LT-SFT] sparse_train_wall_seconds={sparse_train_seconds:.2f}")
+        logger.info(f"[LT-SFT] sparse_train_peak_gpu_allocated_mb={sparse_peak_allocated_mb}")
+        logger.info(f"[LT-SFT] sparse_train_peak_gpu_reserved_mb={sparse_peak_reserved_mb}")
+        logger.info(f"[LT-SFT] sparse_train_peak_cpu_pss_mb={sparse_monitor.peak_pss_mb}")
+        logger.info(f"[LT-SFT] sparse_train_peak_cpu_rss_mb={sparse_monitor.peak_rss_mb}")
         del trainer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

@@ -12,6 +12,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 
 import torch
@@ -40,6 +41,62 @@ def _deepspeed_config(default_path):
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
+
+
+def _dataloader_num_workers():
+    return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
+
+
+def _read_self_rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _read_self_pss_mb():
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+class _PhaseMemoryMonitor:
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.peak_rss_mb = 0
+        self.peak_pss_mb = 0
+        self._thread = None
+
+    def _sample(self):
+        self.peak_rss_mb = max(self.peak_rss_mb, _read_self_rss_mb())
+        self.peak_pss_mb = max(self.peak_pss_mb, _read_self_pss_mb())
+
+    def start(self):
+        self._sample()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def stop(self):
+        self._sample()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        return self
 
 
 class TextDataset(TorchDataset):
@@ -86,7 +143,7 @@ def _ratio_or_env(value, env_name):
 
 
 def _projection_set():
-    raw = os.environ.get("S2FT_TARGET_PROJECTIONS", "v,o,u,d")
+    raw = os.environ.get("S2FT_TARGET_PROJECTIONS", "o,d")
     aliases = {
         "v_proj": "v",
         "o_proj": "o",
@@ -123,6 +180,16 @@ def _resolve_ratios(model, target_params, v_ratio, o_ratio, u_ratio, d_ratio):
         "u": num_layers * intermediate_size * hidden_size,
         "d": num_layers * intermediate_size * hidden_size,
     }
+    preset = os.environ.get("S2FT_RATIO_PRESET", "budget").lower()
+    if preset in {"author", "paper", "official"}:
+        # Official LLaMA2 S2FT scripts use v=0, o=0.052, u=0, d=0.02.
+        # Scale that pattern when a fixed target parameter count is requested.
+        base = {"v": 0.0, "o": 0.052, "u": 0.0, "d": 0.02}
+        base_total = sum(per_full_ratio[name] * ratio for name, ratio in base.items())
+        scale = min(float(target_params) / base_total, 1.0 / max(base.values())) if base_total else 0.0
+        ratios = {name: max(0.0, min(base[name] * scale, 1.0)) for name in per_full_ratio}
+        return ratios, "author_target_params"
+
     enabled = _projection_set()
     denom = sum(params for name, params in per_full_ratio.items() if name in enabled)
     ratio = min(float(target_params) / denom, 1.0) if denom else 0.0
@@ -134,10 +201,26 @@ def _count_selected(total, ratio):
     return max(0, min(total, int(total * ratio)))
 
 
-def _select_random_units(num_layers, units_per_layer, ratio, rng):
+def _split_uniform_counts(total_count, num_layers, rng):
+    if num_layers <= 0:
+        return []
+    base = total_count // num_layers
+    remainder = total_count % num_layers
+    counts = [base] * num_layers
+    for layer in rng.sample(range(num_layers), remainder):
+        counts[layer] += 1
+    return counts
+
+
+def _select_random_units(num_layers, units_per_layer, ratio, rng, allocation):
     selected = {layer: [] for layer in range(num_layers)}
     count = _count_selected(num_layers * units_per_layer, ratio)
     if count <= 0:
+        return selected
+    if allocation == "uniform":
+        for layer, layer_count in enumerate(_split_uniform_counts(count, num_layers, rng)):
+            if layer_count > 0:
+                selected[layer] = sorted(rng.sample(range(units_per_layer), min(layer_count, units_per_layer)))
         return selected
     for flat_idx in sorted(rng.sample(range(num_layers * units_per_layer), count)):
         selected[flat_idx // units_per_layer].append(flat_idx % units_per_layer)
@@ -155,6 +238,22 @@ def _choose_units(scores, count, method):
     candidates.sort(reverse=method in {"large_activation", "large"}, key=lambda item: item[0])
     for _, layer, idx in candidates[: min(count, len(candidates))]:
         selected.setdefault(layer, []).append(idx)
+    return selected
+
+
+def _choose_units_uniform(scores, num_layers, units_per_layer, ratio, method, rng):
+    selected = {layer: [] for layer in range(num_layers)}
+    count = _count_selected(num_layers * units_per_layer, ratio)
+    if count <= 0:
+        return selected
+    reverse = method in {"large_activation", "large"}
+    for layer, layer_count in enumerate(_split_uniform_counts(count, num_layers, rng)):
+        score = scores.get(layer)
+        if layer_count <= 0 or score is None:
+            continue
+        candidates = [(float(value), idx) for idx, value in enumerate(score.tolist())]
+        candidates.sort(reverse=reverse, key=lambda item: item[0])
+        selected[layer] = [idx for _, idx in candidates[: min(layer_count, len(candidates))]]
     return selected
 
 
@@ -216,6 +315,8 @@ def _select_units(model, train_dataset, ratios, method, calibration_steps, calib
     num_layers = len(layers)
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
     intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
+    allocation = os.environ.get("S2FT_LAYER_ALLOCATION", "uniform").lower()
+    rng = random.Random(seed)
 
     if method in {"small_activation", "activation", "large_activation", "large"}:
         scores, completed_steps = _collect_s2ft_activation_scores(
@@ -224,20 +325,27 @@ def _select_units(model, train_dataset, ratios, method, calibration_steps, calib
             calibration_steps=calibration_steps,
             calibration_batch_size=calibration_batch_size,
         )
-        selected = {
-            "v": _choose_units(scores["v"], _count_selected(num_layers * num_heads, ratios["v"]), method),
-            "o": _choose_units(scores["o"], _count_selected(num_layers * num_heads, ratios["o"]), method),
-            "u": _choose_units(scores["u"], _count_selected(num_layers * intermediate_size, ratios["u"]), method),
-            "d": _choose_units(scores["d"], _count_selected(num_layers * intermediate_size, ratios["d"]), method),
-        }
+        if allocation == "uniform":
+            selected = {
+                "v": _choose_units_uniform(scores["v"], num_layers, num_heads, ratios["v"], method, rng),
+                "o": _choose_units_uniform(scores["o"], num_layers, num_heads, ratios["o"], method, rng),
+                "u": _choose_units_uniform(scores["u"], num_layers, intermediate_size, ratios["u"], method, rng),
+                "d": _choose_units_uniform(scores["d"], num_layers, intermediate_size, ratios["d"], method, rng),
+            }
+        else:
+            selected = {
+                "v": _choose_units(scores["v"], _count_selected(num_layers * num_heads, ratios["v"]), method),
+                "o": _choose_units(scores["o"], _count_selected(num_layers * num_heads, ratios["o"]), method),
+                "u": _choose_units(scores["u"], _count_selected(num_layers * intermediate_size, ratios["u"]), method),
+                "d": _choose_units(scores["d"], _count_selected(num_layers * intermediate_size, ratios["d"]), method),
+            }
         return selected, completed_steps
 
-    rng = random.Random(seed)
     selected = {
-        "v": _select_random_units(num_layers, num_heads, ratios["v"], rng),
-        "o": _select_random_units(num_layers, num_heads, ratios["o"], rng),
-        "u": _select_random_units(num_layers, intermediate_size, ratios["u"], rng),
-        "d": _select_random_units(num_layers, intermediate_size, ratios["d"], rng),
+        "v": _select_random_units(num_layers, num_heads, ratios["v"], rng, allocation),
+        "o": _select_random_units(num_layers, num_heads, ratios["o"], rng, allocation),
+        "u": _select_random_units(num_layers, intermediate_size, ratios["u"], rng, allocation),
+        "d": _select_random_units(num_layers, intermediate_size, ratios["d"], rng, allocation),
     }
     return selected, 0
 
@@ -482,12 +590,33 @@ def train_s2ft(
         logging_steps=5,
         report_to=report_to,
         seed=seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=_dataloader_num_workers(),
         remove_unused_columns=False,
         deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, tokenizer=tokenizer)
-    trainer.train(resume_from_checkpoint=get_last_checkpoint(output_dir))
+    resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}
+    existing_checkpoint = get_last_checkpoint(output_dir)
+    resume_checkpoint = existing_checkpoint if resume_training else None
+    if existing_checkpoint and not resume_training:
+        logger.warning(f"[S2FT] Ignoring existing checkpoint because RESUME_TRAINING=false: {existing_checkpoint}")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    train_start = time.time()
+    train_monitor = _PhaseMemoryMonitor().start()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    train_monitor.stop()
+    train_seconds = time.time() - train_start
+    peak_allocated_mb = 0
+    peak_reserved_mb = 0
+    if torch.cuda.is_available():
+        peak_allocated_mb = torch.cuda.max_memory_allocated() // (1024 * 1024)
+        peak_reserved_mb = torch.cuda.max_memory_reserved() // (1024 * 1024)
+    logger.info(f"[S2FT] train_wall_seconds={train_seconds:.2f}")
+    logger.info(f"[S2FT] train_peak_gpu_allocated_mb={peak_allocated_mb}")
+    logger.info(f"[S2FT] train_peak_gpu_reserved_mb={peak_reserved_mb}")
+    logger.info(f"[S2FT] train_peak_cpu_pss_mb={train_monitor.peak_pss_mb}")
+    logger.info(f"[S2FT] train_peak_cpu_rss_mb={train_monitor.peak_rss_mb}")
 
     if os.environ.get("RAPA_SKIP_SAVE", "false").lower() in {"1", "true", "yes"}:
         logger.info("[S2FT] RAPA_SKIP_SAVE=true; skipping model save for profiling")

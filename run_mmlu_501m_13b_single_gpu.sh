@@ -29,7 +29,7 @@ export METRICS_FILE="${METRICS_FILE:-${RESULT_ROOT}/metrics.tsv}"
 
 # Methods to run. Override to test a subset, e.g. METHODS="sift smt".
 # export METHODS="${METHODS:-sift spiel smt s2ft ltsft}"
-export METHODS="${METHODS:-spiel}"
+export METHODS="${METHODS:-s2ft}"
 
 # GPU selection:
 # Prefer CUDA_VISIBLE_DEVICES from the command line.
@@ -70,8 +70,11 @@ export SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
 export SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
 export S2FT_CALIBRATION_STEPS="${S2FT_CALIBRATION_STEPS:-100}"
 export S2FT_CALIBRATION_BATCH_SIZE="${S2FT_CALIBRATION_BATCH_SIZE:-1}"
+export S2FT_RATIO_PRESET="${S2FT_RATIO_PRESET:-budget}"
+export S2FT_LAYER_ALLOCATION="${S2FT_LAYER_ALLOCATION:-uniform}"
 export LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 export LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
+export RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
 
 # For fairer SMT comparison: include attention + MLP projections.
 # The SMT implementation reads this environment variable.

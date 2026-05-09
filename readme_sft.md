@@ -9,7 +9,7 @@
 | **SIFT** | [song-wx/SIFT](https://github.com/song-wx/SIFT) | Gradient top-k element-wise | calibration gradient의 absolute value 상위 weight element를 선택하여 학습 |
 | **SpiEL** | [ducdauge/sft-llm](https://github.com/ducdauge/sft-llm) + [AlanAnsell/peft](https://github.com/AlanAnsell/peft) | Dynamic scatter sparse | RigL/SM3 기반 prune-regrow selection으로 sparse delta 위치를 재선택하며 학습 |
 | **SMT** | [HectorHHZ/Sparse_Matrix_Tuning](https://github.com/HectorHHZ/Sparse_Matrix_Tuning) | Block-sparse (256x256) | calibration gradient score 상위 256x256 block을 선택하여 학습 |
-| **S2FT** | [Infini-AI-Lab/S2FT](https://github.com/Infini-AI-Lab/S2FT) | Structured heads/channels | activation calibration으로 attention head와 FFN channel을 선택하고 coupled row/column을 학습 |
+| **S2FT** | [Infini-AI-Lab/S2FT](https://github.com/Infini-AI-Lab/S2FT) | Structured heads/channels | random 또는 score 기반으로 attention head와 FFN channel을 선택하고, coupled row/column co-permutation 후 dense submatrix를 학습 |
 | **LT-SFT** | [cambridgeltl/composable-sft](https://github.com/cambridgeltl/composable-sft) | Lottery ticket | dense mask-search 후 `|theta_search - theta_0|` 상위 element를 선택하여 sparse fine-tuning |
 
 모든 method에서 **~170M trainable parameters** (전체 7B 모델의 ~2.35%)를 사용합니다.
