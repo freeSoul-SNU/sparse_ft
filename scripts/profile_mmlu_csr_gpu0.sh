@@ -25,6 +25,8 @@ CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-}"
 GPU_INDEX="${GPU_INDEX:-0}"
 METHODS="${METHODS:-sift spiel smt s2ft ltsft}"
 MAX_STEPS="${MAX_STEPS:-}"
+LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
+LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 MMLU_DATASET="${MMLU_DATASET:-${RAPA_HOME}/OwLore_Dataset/mmlu/mmlu.json}"
 CSR_DATASET="${CSR_DATASET:-${RAPA_HOME}/OwLore_Dataset/merge/merge.json}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -41,6 +43,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_INDEX}}"
 export RAPA_HOME
+export LTSFT_MASK_SEARCH_STEPS LTSFT_N_FT_ITERATIONS
 export SPARSE_FT_ROOT="${REPO_ROOT}"
 export PEFT_DIR="${PEFT_DIR:-${RAPA_HOME}/peft}"
 export PYTHONPATH="${LMFLOW_DIR}/src:${REPO_ROOT}:${PYTHONPATH:-}"
@@ -135,6 +138,8 @@ run_profile() {
         --lr_scheduler_type "${lr_sched}" \
         --max_seq_length "${max_seq}" \
         --target_params 170000000 \
+        --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
+        --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
         --bf16 \
         --hf_token "${HF_TOKEN}" \
         --seed 42 \

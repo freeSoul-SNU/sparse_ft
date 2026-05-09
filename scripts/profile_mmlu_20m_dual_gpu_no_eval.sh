@@ -14,10 +14,12 @@ DATASET="${DATASET:-${RAPA_HOME}/OwLore_Dataset/mmlu/mmlu.json}"
 RESULT_ROOT="${RESULT_ROOT:-${RAPA_HOME}/profile_mmlu_20m_dual_gpu_no_eval}"
 LOG_ROOT="${LOG_ROOT:-${RESULT_ROOT}/logs}"
 METRICS_FILE="${METRICS_FILE:-${RESULT_ROOT}/metrics.tsv}"
+ATTEMPTS_FILE="${ATTEMPTS_FILE:-${RESULT_ROOT}/attempts.tsv}"
 GPU0_METHODS="${GPU0_METHODS-sift smt ltsft}"
 GPU1_METHODS="${GPU1_METHODS-spiel s2ft}"
 CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-ltsft}"
 ENABLE_OFFLOAD_RETRY="${ENABLE_OFFLOAD_RETRY:-true}"
+OFFLOAD_RETRY_ON_ANY_FAILURE="${OFFLOAD_RETRY_ON_ANY_FAILURE:-false}"
 PROFILE_STEPS="${PROFILE_STEPS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
@@ -27,6 +29,8 @@ TARGET_PARAMS="${TARGET_PARAMS:-20000000}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-2}"
 SYNC_LMFLOW="${SYNC_LMFLOW:-auto}"
+BASE_DS_CONFIG="${BASE_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
+OFFLOAD_DS_CONFIG="${OFFLOAD_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero2_offload.json}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 export HF_HOME="${HF_HOME:-${RAPA_HOME}/hf_cache}"
@@ -53,7 +57,14 @@ export SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
 export SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
 export S2FT_CALIBRATION_STEPS="${S2FT_CALIBRATION_STEPS:-100}"
 export S2FT_CALIBRATION_BATCH_SIZE="${S2FT_CALIBRATION_BATCH_SIZE:-1}"
+export S2FT_SELECTION_METHOD="${S2FT_SELECTION_METHOD:-random}"
+export S2FT_TARGET_PROJECTIONS="${S2FT_TARGET_PROJECTIONS:-v,o,u,d}"
+export S2FT_V_RATIO="${S2FT_V_RATIO:-}"
+export S2FT_O_RATIO="${S2FT_O_RATIO:-}"
+export S2FT_U_RATIO="${S2FT_U_RATIO:-}"
+export S2FT_D_RATIO="${S2FT_D_RATIO:-}"
 export LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
+export LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 
 mkdir -p "${RESULT_ROOT}" "${LOG_ROOT}" "${HF_HOME}"
 
@@ -93,9 +104,8 @@ sync_lmflow_sources() {
 
 sync_lmflow_sources
 
-if [ ! -f "${METRICS_FILE}" ]; then
-    printf 'timestamp\tmethod\tgpu\toffload_enabled\texit_code\telapsed_sec\tprofile_steps\testimated_total_steps\ttrain_runtime_sec\testimated_train_sec\testimated_total_wall_sec\tweight_selection_sec\tcalibration_sec\tpeak_gpu_mb\tpeak_cpu_rss_mb\tpeak_total_mb\toffload_elapsed_sec\tlog_file\toutput_dir\n' > "${METRICS_FILE}"
-fi
+printf 'timestamp\tmethod\tgpu\tfinal_offload_enabled\tretry_used\tfinal_exit_code\ttotal_elapsed_sec\tprimary_elapsed_sec\toffload_elapsed_sec\tprofile_steps\testimated_total_steps\ttrain_runtime_sec\testimated_train_sec\testimated_total_wall_sec\tweight_selection_sec\tcalibration_sec\tpeak_gpu_mb\tpeak_cpu_rss_mb\tpeak_total_mb\tbatch_size\tgrad_accum\tlearning_rate\tlog_file\toutput_dir\n' > "${METRICS_FILE}"
+printf 'timestamp\tmethod\tgpu\tattempt\toffload_enabled\texit_code\telapsed_sec\tprofile_steps\testimated_total_steps\ttrain_runtime_sec\testimated_train_sec\testimated_total_wall_sec\tweight_selection_sec\tcalibration_sec\tpeak_gpu_mb\tpeak_cpu_rss_mb\tpeak_total_mb\tbatch_size\tgrad_accum\tlearning_rate\tlog_file\toutput_dir\n' > "${ATTEMPTS_FILE}"
 
 dataset_size="$(
     python - <<PY
@@ -199,8 +209,13 @@ method_uses_offload() {
     return 1
 }
 
-append_metrics() {
-    local method="$1" gpu="$2" offload="$3" exit_code="$4" elapsed="$5" log_file="$6" output_dir="$7" offload_elapsed="$8" monitor_file="$9"
+is_oom_failure() {
+    local log_file="$1"
+    grep -Eiq 'out of memory|CUDA error: out of memory|CUDA out of memory|CUBLAS_STATUS_ALLOC_FAILED|CUDNN_STATUS_ALLOC_FAILED|DeepSpeed.*OOM|OOM' "${log_file}" 2>/dev/null
+}
+
+append_attempt_metrics() {
+    local method="$1" gpu="$2" attempt="$3" offload="$4" exit_code="$5" elapsed="$6" log_file="$7" output_dir="$8" monitor_file="$9"
     local train_runtime weight_selection calibration peak_gpu peak_cpu estimated_train estimated_wall internal_gpu internal_cpu peak_total
 
     train_runtime="$(train_runtime_from_log "${log_file}")"
@@ -226,11 +241,34 @@ append_metrics() {
         estimated_wall=""
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${TIMESTAMP}" "${method}" "${gpu}" "${offload}" "${exit_code}" "${elapsed}" \
+    LAST_TRAIN_RUNTIME="${train_runtime}"
+    LAST_WEIGHT_SELECTION="${weight_selection}"
+    LAST_CALIBRATION="${calibration}"
+    LAST_PEAK_GPU="${peak_gpu}"
+    LAST_PEAK_CPU="${peak_cpu}"
+    LAST_PEAK_TOTAL="${peak_total}"
+    LAST_ESTIMATED_TRAIN="${estimated_train}"
+    LAST_ESTIMATED_WALL="${estimated_wall}"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${TIMESTAMP}" "${method}" "${gpu}" "${attempt}" "${offload}" "${exit_code}" "${elapsed}" \
         "${PROFILE_STEPS}" "${estimated_total_steps}" "${train_runtime}" "${estimated_train}" \
         "${estimated_wall}" "${weight_selection}" "${calibration}" "${peak_gpu}" "${peak_cpu}" \
-        "${peak_total}" "${offload_elapsed}" "${log_file}" "${output_dir}" >> "${METRICS_FILE}"
+        "${peak_total}" "${BATCH_SIZE}" "${GRAD_ACCUM}" "${LEARNING_RATE}" "${log_file}" "${output_dir}" >> "${ATTEMPTS_FILE}"
+}
+
+append_method_summary() {
+    local method="$1" gpu="$2" final_offload="$3" retry_used="$4" final_exit_code="$5" total_elapsed="$6"
+    local primary_elapsed="$7" offload_elapsed="$8" train_runtime="$9" estimated_train="${10}"
+    local estimated_wall="${11}" weight_selection="${12}" calibration="${13}" peak_gpu="${14}"
+    local peak_cpu="${15}" peak_total="${16}" log_file="${17}" output_dir="${18}"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${TIMESTAMP}" "${method}" "${gpu}" "${final_offload}" "${retry_used}" "${final_exit_code}" \
+        "${total_elapsed}" "${primary_elapsed}" "${offload_elapsed}" "${PROFILE_STEPS}" \
+        "${estimated_total_steps}" "${train_runtime}" "${estimated_train}" "${estimated_wall}" \
+        "${weight_selection}" "${calibration}" "${peak_gpu}" "${peak_cpu}" "${peak_total}" \
+        "${BATCH_SIZE}" "${GRAD_ACCUM}" "${LEARNING_RATE}" "${log_file}" "${output_dir}" >> "${METRICS_FILE}"
 }
 
 run_one_attempt() {
@@ -245,9 +283,28 @@ run_one_attempt() {
     mkdir -p "${output_dir}" "${log_dir}"
 
     if [ "${offload}" = "true" ]; then
-        ds_config="${SPARSE_FT_ROOT}/configs/ds_zero2_offload.json"
+        ds_config="${OFFLOAD_DS_CONFIG}"
     else
-        ds_config="none"
+        ds_config="${BASE_DS_CONFIG}"
+    fi
+
+    local s2ft_extra_args=()
+    if [ "${method}" = "s2ft" ]; then
+        if [ -n "${S2FT_SELECTION_METHOD}" ]; then
+            s2ft_extra_args+=(--s2ft_selection_method "${S2FT_SELECTION_METHOD}")
+        fi
+        if [ -n "${S2FT_V_RATIO}" ] && [ "${S2FT_V_RATIO}" != "auto" ]; then
+            s2ft_extra_args+=(--s2ft_v_ratio "${S2FT_V_RATIO}")
+        fi
+        if [ -n "${S2FT_O_RATIO}" ] && [ "${S2FT_O_RATIO}" != "auto" ]; then
+            s2ft_extra_args+=(--s2ft_o_ratio "${S2FT_O_RATIO}")
+        fi
+        if [ -n "${S2FT_U_RATIO}" ] && [ "${S2FT_U_RATIO}" != "auto" ]; then
+            s2ft_extra_args+=(--s2ft_u_ratio "${S2FT_U_RATIO}")
+        fi
+        if [ -n "${S2FT_D_RATIO}" ] && [ "${S2FT_D_RATIO}" != "auto" ]; then
+            s2ft_extra_args+=(--s2ft_d_ratio "${S2FT_D_RATIO}")
+        fi
     fi
 
     port=$((29500 + RANDOM % 1000))
@@ -277,7 +334,9 @@ run_one_attempt() {
             --smt_calibration_batch_size "${SMT_CALIBRATION_BATCH_SIZE}" \
             --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
             --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
+            "${s2ft_extra_args[@]}" \
             --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
+            --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
             --bf16 \
             --seed 42
     ) > "${log_file}" 2>&1 &
@@ -291,7 +350,17 @@ run_one_attempt() {
     wait "${monitor_pid}" 2>/dev/null || true
 
     elapsed=$(( $(date +%s) - start ))
-    append_metrics "${method}" "${gpu}" "${offload}" "${exit_code}" "${elapsed}" "${log_file}" "${output_dir}" "$([ "${offload}" = "true" ] && echo "${elapsed}" || echo 0)" "${monitor_file}"
+    append_attempt_metrics "${method}" "${gpu}" "${attempt}" "${offload}" "${exit_code}" "${elapsed}" "${log_file}" "${output_dir}" "${monitor_file}"
+
+    LAST_EXIT_CODE="${exit_code}"
+    LAST_ELAPSED="${elapsed}"
+    LAST_OFFLOAD="${offload}"
+    LAST_LOG_FILE="${log_file}"
+    LAST_OUTPUT_DIR="${output_dir}"
+    LAST_OOM=false
+    if is_oom_failure "${log_file}"; then
+        LAST_OOM=true
+    fi
 
     echo "[profile] method=${method} gpu=${gpu} offload=${offload} exit=${exit_code} elapsed=${elapsed}s log=${log_file}"
     return "${exit_code}"
@@ -299,18 +368,70 @@ run_one_attempt() {
 
 run_method() {
     local method="$1" gpu="$2" use_offload=false
+    local retry_used=false total_elapsed primary_elapsed=0 offload_elapsed=0
+    local primary_peak_gpu=0 primary_peak_cpu=0 primary_peak_total=0
+    local final_exit final_offload final_train_runtime final_estimated_train final_estimated_wall
+    local final_weight_selection final_calibration final_peak_gpu final_peak_cpu final_peak_total
+    local final_log_file final_output_dir
     if method_uses_offload "${method}"; then
         use_offload=true
     fi
 
     if run_one_attempt "${method}" "${gpu}" "${use_offload}" "primary"; then
-        return 0
+        :
+    else
+        primary_peak_gpu="${LAST_PEAK_GPU}"
+        primary_peak_cpu="${LAST_PEAK_CPU}"
+        primary_peak_total="${LAST_PEAK_TOTAL}"
+        if [ "${use_offload}" != "true" ] && [ "${ENABLE_OFFLOAD_RETRY}" = "true" ] && \
+           { [ "${OFFLOAD_RETRY_ON_ANY_FAILURE}" = "true" ] || [ "${LAST_OOM}" = "true" ]; }; then
+            echo "[profile] ${method} failed with likely OOM; retrying with CPU optimizer offload at the same batch_size=${BATCH_SIZE}, grad_accum=${GRAD_ACCUM}"
+            primary_elapsed="${LAST_ELAPSED}"
+            retry_used=true
+            run_one_attempt "${method}" "${gpu}" "true" "offload_retry" || true
+            offload_elapsed="${LAST_ELAPSED}"
+        fi
     fi
 
-    if [ "${use_offload}" != "true" ] && [ "${ENABLE_OFFLOAD_RETRY}" = "true" ]; then
-        echo "[profile] ${method} failed without offload; retrying with CPU optimizer offload"
-        run_one_attempt "${method}" "${gpu}" "true" "offload_retry" || true
+    if [ "${retry_used}" != "true" ]; then
+        primary_elapsed="${LAST_ELAPSED}"
+        if [ "${LAST_OFFLOAD}" = "true" ]; then
+            offload_elapsed="${LAST_ELAPSED}"
+        fi
     fi
+    if [ "${retry_used}" = "true" ]; then
+        total_elapsed=$((primary_elapsed + offload_elapsed))
+    else
+        total_elapsed="${primary_elapsed}"
+    fi
+    final_exit="${LAST_EXIT_CODE}"
+    final_offload="${LAST_OFFLOAD}"
+    final_train_runtime="${LAST_TRAIN_RUNTIME}"
+    final_estimated_train="${LAST_ESTIMATED_TRAIN}"
+    final_estimated_wall="${LAST_ESTIMATED_WALL}"
+    if [ "${retry_used}" = "true" ] && [ -n "${final_estimated_wall}" ]; then
+        final_estimated_wall="$(awk -v p="${primary_elapsed}" -v e="${final_estimated_wall}" 'BEGIN{printf "%.2f", p + e}')"
+    fi
+    final_weight_selection="${LAST_WEIGHT_SELECTION}"
+    final_calibration="${LAST_CALIBRATION}"
+    final_peak_gpu="${LAST_PEAK_GPU}"
+    final_peak_cpu="${LAST_PEAK_CPU}"
+    final_peak_total="${LAST_PEAK_TOTAL}"
+    if [ "${retry_used}" = "true" ]; then
+        final_peak_gpu="$(awk -v a="${primary_peak_gpu}" -v b="${final_peak_gpu}" 'BEGIN{print (a>b ? a : b)}')"
+        final_peak_cpu="$(awk -v a="${primary_peak_cpu}" -v b="${final_peak_cpu}" 'BEGIN{print (a>b ? a : b)}')"
+        final_peak_total="$(awk -v a="${primary_peak_total}" -v b="${final_peak_total}" 'BEGIN{print (a>b ? a : b)}')"
+    fi
+    final_log_file="${LAST_LOG_FILE}"
+    final_output_dir="${LAST_OUTPUT_DIR}"
+
+    append_method_summary "${method}" "${gpu}" "${final_offload}" "${retry_used}" "${final_exit}" \
+        "${total_elapsed}" "${primary_elapsed}" "${offload_elapsed}" "${final_train_runtime}" \
+        "${final_estimated_train}" "${final_estimated_wall}" "${final_weight_selection}" \
+        "${final_calibration}" "${final_peak_gpu}" "${final_peak_cpu}" "${final_peak_total}" \
+        "${final_log_file}" "${final_output_dir}"
+
+    return 0
 }
 
 worker() {

@@ -1,24 +1,38 @@
-"""S2FT (Structured Sparse Fine-Tuning) with head/channel selection.
+"""S2FT integration based on the official structured-sparsity implementation.
 
-S2FT selects sparse coupled structures, not arbitrary random weights: attention
-heads in MHA and intermediate channels in FFN.  By default this implementation
-uses the paper's small-activation criterion, then updates the corresponding
-dense substructures through sparse deltas.
+The active trainable structures are the S2FT projections used by the reference
+code: ``v_proj``/``o_proj`` for attention and ``up_proj``/``down_proj`` for FFN.
+The base weights are frozen and only each S2 layer's ``s2`` parameter is
+optimized.
 """
+import copy
+import json
 import logging
 import os
-import json
+import random
 import re
+import sys
 import time
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
 RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
+SPARSE_FT_ROOT = os.environ.get(
+    "SPARSE_FT_ROOT",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+if SPARSE_FT_ROOT not in sys.path:
+    sys.path.insert(0, SPARSE_FT_ROOT)
+
+try:
+    from methods.s2ft import S2ColumnLinear, S2RowLinear
+except ImportError:
+    from s2ft import S2ColumnLinear, S2RowLinear
 
 
 def _deepspeed_config(default_path):
@@ -26,15 +40,6 @@ def _deepspeed_config(default_path):
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
-
-
-try:
-    from lmflow.pipeline.rapa.sift_tuner import SparseLinear
-except ImportError:
-    try:
-        from .sift_tuner import SparseLinear
-    except ImportError:
-        from sift_tuner import SparseLinear
 
 
 class TextDataset(TorchDataset):
@@ -45,8 +50,12 @@ class TextDataset(TorchDataset):
             enc = tokenizer(text, truncation=True, max_length=max_len, padding="max_length", return_tensors="pt")
             ids = enc["input_ids"].squeeze()
             self.data.append({"input_ids": ids, "labels": ids.clone()})
-    def __len__(self): return len(self.data)
-    def __getitem__(self, i): return self.data[i]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, i):
+        return self.data[i]
 
 
 def _move_batch_to_device(batch, device):
@@ -58,42 +67,100 @@ def _layer_id(name):
     return int(match.group(1)) if match else None
 
 
-def _flat_indices_for_rows(module, rows):
-    rows = sorted(set(int(r) for r in rows if 0 <= int(r) < module.out_features))
-    return torch.tensor(
-        [r * module.in_features + c for r in rows for c in range(module.in_features)],
-        dtype=torch.long,
-    )
+def _get_layers(model):
+    try:
+        return model.model.layers
+    except AttributeError as exc:
+        raise ValueError("S2FT currently expects a LLaMA-style model with model.layers") from exc
 
 
-def _flat_indices_for_columns(module, cols):
-    cols = sorted(set(int(c) for c in cols if 0 <= int(c) < module.in_features))
-    return torch.tensor(
-        [r * module.in_features + c for r in range(module.out_features) for c in cols],
-        dtype=torch.long,
-    )
+def _env_float(name):
+    value = os.environ.get(name)
+    if value is None or value.lower() in {"", "auto", "none", "null"}:
+        return None
+    return float(value)
 
 
-def _replace_linear_with_indices(model, name_to_indices):
-    replacements = 0
-    for name, flat_idx in name_to_indices.items():
-        if flat_idx.numel() == 0:
+def _ratio_or_env(value, env_name):
+    return float(value) if value is not None else _env_float(env_name)
+
+
+def _projection_set():
+    raw = os.environ.get("S2FT_TARGET_PROJECTIONS", "v,o,u,d")
+    aliases = {
+        "v_proj": "v",
+        "o_proj": "o",
+        "up_proj": "u",
+        "down_proj": "d",
+    }
+    projections = []
+    for item in raw.split(","):
+        key = item.strip().lower()
+        if not key:
             continue
-        parts = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        module = getattr(parent, parts[-1])
-        if isinstance(module, nn.Linear):
-            setattr(parent, parts[-1], SparseLinear(module, flat_idx))
-            replacements += 1
-    return replacements
+        projections.append(aliases.get(key, key))
+    return set(projections)
+
+
+def _resolve_ratios(model, target_params, v_ratio, o_ratio, u_ratio, d_ratio):
+    explicit = {
+        "v": _ratio_or_env(v_ratio, "S2FT_V_RATIO"),
+        "o": _ratio_or_env(o_ratio, "S2FT_O_RATIO"),
+        "u": _ratio_or_env(u_ratio, "S2FT_U_RATIO"),
+        "d": _ratio_or_env(d_ratio, "S2FT_D_RATIO"),
+    }
+    if any(value is not None for value in explicit.values()):
+        return {name: max(0.0, min(float(value or 0.0), 1.0)) for name, value in explicit.items()}, "explicit"
+
+    num_layers = len(_get_layers(model))
+    hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
+    num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
+    head_dim = hidden_size // num_heads if num_heads else 0
+    per_full_ratio = {
+        "v": num_layers * num_heads * hidden_size * head_dim,
+        "o": num_layers * num_heads * hidden_size * head_dim,
+        "u": num_layers * intermediate_size * hidden_size,
+        "d": num_layers * intermediate_size * hidden_size,
+    }
+    enabled = _projection_set()
+    denom = sum(params for name, params in per_full_ratio.items() if name in enabled)
+    ratio = min(float(target_params) / denom, 1.0) if denom else 0.0
+    ratios = {name: ratio if name in enabled else 0.0 for name in per_full_ratio}
+    return ratios, "target_params"
+
+
+def _count_selected(total, ratio):
+    return max(0, min(total, int(total * ratio)))
+
+
+def _select_random_units(num_layers, units_per_layer, ratio, rng):
+    selected = {layer: [] for layer in range(num_layers)}
+    count = _count_selected(num_layers * units_per_layer, ratio)
+    if count <= 0:
+        return selected
+    for flat_idx in sorted(rng.sample(range(num_layers * units_per_layer), count)):
+        selected[flat_idx // units_per_layer].append(flat_idx % units_per_layer)
+    return selected
+
+
+def _choose_units(scores, count, method):
+    selected = {layer: [] for layer in scores}
+    if count <= 0 or not scores:
+        return selected
+    candidates = []
+    for layer, score in scores.items():
+        for idx, value in enumerate(score.tolist()):
+            candidates.append((float(value), layer, idx))
+    candidates.sort(reverse=method in {"large_activation", "large"}, key=lambda item: item[0])
+    for _, layer, idx in candidates[: min(count, len(candidates))]:
+        selected.setdefault(layer, []).append(idx)
+    return selected
 
 
 def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, calibration_batch_size):
     device = next(model.parameters()).device
-    attn_scores = {}
-    ffn_scores = {}
+    scores = {"v": {}, "o": {}, "u": {}, "d": {}}
     hooks = []
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
     hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
@@ -104,22 +171,25 @@ def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, cal
         if layer is None:
             return
 
-        def hook(_, __, output):
+        def hook(_, inputs, output):
             with torch.no_grad():
-                out = output.detach().float().abs()
-                if name.endswith("q_proj") and num_heads and head_dim:
-                    score = out.reshape(-1, num_heads, head_dim).mean(dim=(0, 2)).cpu()
-                    attn_scores[layer] = attn_scores.get(layer, torch.zeros_like(score)) + score
-                elif name.endswith("gate_proj") or name.endswith("up_proj"):
-                    score = out.reshape(-1, out.shape[-1]).mean(dim=0).cpu()
-                    ffn_scores[layer] = ffn_scores.get(layer, torch.zeros_like(score)) + score
+                if name.endswith("v_proj") and num_heads and head_dim:
+                    out = output.detach().float().abs().reshape(-1, num_heads, head_dim)
+                    scores["v"][layer] = out.mean(dim=(0, 2)).cpu()
+                elif name.endswith("o_proj") and num_heads and head_dim:
+                    inp = inputs[0].detach().float().abs().reshape(-1, num_heads, head_dim)
+                    scores["o"][layer] = inp.mean(dim=(0, 2)).cpu()
+                elif name.endswith("up_proj"):
+                    out = output.detach().float().abs().reshape(-1, output.shape[-1])
+                    scores["u"][layer] = out.mean(dim=0).cpu()
+                elif name.endswith("down_proj"):
+                    inp = inputs[0].detach().float().abs().reshape(-1, inputs[0].shape[-1])
+                    scores["d"][layer] = inp.mean(dim=0).cpu()
 
         hooks.append(module.register_forward_hook(hook))
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and (
-            name.endswith("q_proj") or name.endswith("gate_proj") or name.endswith("up_proj")
-        ):
+        if isinstance(module, nn.Linear) and name.endswith(("v_proj", "o_proj", "up_proj", "down_proj")):
             add_hook(name, module)
 
     if hasattr(model.config, "use_cache"):
@@ -138,57 +208,186 @@ def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, cal
 
     for hook in hooks:
         hook.remove()
-    return attn_scores, ffn_scores, completed_steps
+    return scores, completed_steps
 
 
-def _choose_units(scores, count, method):
-    if count <= 0 or not scores:
-        return {}
-    candidates = []
-    for layer, score in scores.items():
-        for idx, value in enumerate(score.tolist()):
-            candidates.append((float(value), layer, idx))
-    reverse = method in {"large_activation", "large"}
-    candidates.sort(reverse=reverse, key=lambda item: item[0])
-    selected = {}
-    for _, layer, idx in candidates[: min(count, len(candidates))]:
-        selected.setdefault(layer, []).append(idx)
-    return selected
-
-
-def _build_s2ft_indices(model, selected_heads, selected_channels):
-    modules = {name: module for name, module in model.named_modules() if isinstance(module, nn.Linear)}
+def _select_units(model, train_dataset, ratios, method, calibration_steps, calibration_batch_size, seed):
+    layers = _get_layers(model)
+    num_layers = len(layers)
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
-    hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
-    head_dim = hidden_size // num_heads if num_heads else 0
-    name_to_indices = {}
+    intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
 
-    for name, module in modules.items():
-        layer = _layer_id(name)
-        if layer is None:
+    if method in {"small_activation", "activation", "large_activation", "large"}:
+        scores, completed_steps = _collect_s2ft_activation_scores(
+            model=model,
+            train_dataset=train_dataset,
+            calibration_steps=calibration_steps,
+            calibration_batch_size=calibration_batch_size,
+        )
+        selected = {
+            "v": _choose_units(scores["v"], _count_selected(num_layers * num_heads, ratios["v"]), method),
+            "o": _choose_units(scores["o"], _count_selected(num_layers * num_heads, ratios["o"]), method),
+            "u": _choose_units(scores["u"], _count_selected(num_layers * intermediate_size, ratios["u"]), method),
+            "d": _choose_units(scores["d"], _count_selected(num_layers * intermediate_size, ratios["d"]), method),
+        }
+        return selected, completed_steps
+
+    rng = random.Random(seed)
+    selected = {
+        "v": _select_random_units(num_layers, num_heads, ratios["v"], rng),
+        "o": _select_random_units(num_layers, num_heads, ratios["o"], rng),
+        "u": _select_random_units(num_layers, intermediate_size, ratios["u"], rng),
+        "d": _select_random_units(num_layers, intermediate_size, ratios["d"], rng),
+    }
+    return selected, 0
+
+
+def _replace_with_s2_column(module, start, end):
+    checkpoint = copy.deepcopy(module.state_dict())
+    replacement = S2ColumnLinear(
+        in_features=module.in_features,
+        out_features=module.out_features,
+        bias=module.bias is not None,
+        start=start,
+        end=end,
+        device=next(module.parameters()).device,
+        dtype=next(module.parameters()).dtype,
+    )
+    replacement.load_state_dict(checkpoint, strict=False)
+    return replacement
+
+
+def _replace_with_s2_row(module, start, end):
+    checkpoint = copy.deepcopy(module.state_dict())
+    replacement = S2RowLinear(
+        in_features=module.in_features,
+        out_features=module.out_features,
+        bias=module.bias is not None,
+        start=start,
+        end=end,
+        device=next(module.parameters()).device,
+        dtype=next(module.parameters()).dtype,
+    )
+    replacement.load_state_dict(checkpoint, strict=False)
+    return replacement
+
+
+def _reorder_rows_by_units(linear, order, unit_size=1):
+    weight = linear.weight.data
+    expected = len(order) * unit_size
+    if weight.shape[0] != expected:
+        logger.warning("[S2FT] skipping row reorder for shape=%s expected_rows=%s", tuple(weight.shape), expected)
+        return
+    weight = weight.reshape(len(order), unit_size, weight.shape[-1])
+    linear.weight.data = weight[order, :, :].reshape(-1, weight.shape[-1])
+    if linear.bias is not None:
+        bias = linear.bias.data.reshape(len(order), unit_size)
+        linear.bias.data = bias[order, :].reshape(-1)
+
+
+def _reorder_columns_by_units(linear, order, unit_size=1):
+    weight = linear.weight.data
+    expected = len(order) * unit_size
+    if weight.shape[1] != expected:
+        logger.warning("[S2FT] skipping column reorder for shape=%s expected_cols=%s", tuple(weight.shape), expected)
+        return
+    weight = weight.reshape(weight.shape[0], len(order), unit_size)
+    linear.weight.data = weight[:, order, :].reshape(weight.shape[0], -1)
+
+
+def _convert_mha_layer_to_s2(model, selected):
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    replacements = 0
+    for layer_idx, layer in enumerate(_get_layers(model)):
+        selected_v = set(selected["v"].get(layer_idx, []))
+        selected_o = set(selected["o"].get(layer_idx, []))
+        only_v = sorted(selected_v - selected_o)
+        only_o = sorted(selected_o - selected_v)
+        vo = sorted(selected_v & selected_o)
+        order = only_v + vo + only_o
+        order.extend(head for head in range(model.config.num_attention_heads) if head not in order)
+
+        if only_v or vo:
+            layer.self_attn.v_proj = _replace_with_s2_column(
+                layer.self_attn.v_proj,
+                start=0,
+                end=(len(only_v) + len(vo)) * head_dim,
+            )
+            replacements += 1
+        if only_o or vo:
+            layer.self_attn.o_proj = _replace_with_s2_row(
+                layer.self_attn.o_proj,
+                start=len(only_v) * head_dim,
+                end=(len(only_v) + len(vo) + len(only_o)) * head_dim,
+            )
+            replacements += 1
+
+        _reorder_rows_by_units(layer.self_attn.q_proj, order, head_dim)
+        _reorder_rows_by_units(layer.self_attn.k_proj, order, head_dim)
+        _reorder_rows_by_units(layer.self_attn.v_proj, order, head_dim)
+        _reorder_columns_by_units(layer.self_attn.o_proj, order, head_dim)
+    return replacements
+
+
+def _convert_ffn_layer_to_s2(model, selected):
+    replacements = 0
+    for layer_idx, layer in enumerate(_get_layers(model)):
+        selected_u = set(selected["u"].get(layer_idx, []))
+        selected_d = set(selected["d"].get(layer_idx, []))
+        only_u = sorted(selected_u - selected_d)
+        only_d = sorted(selected_d - selected_u)
+        ud = sorted(selected_u & selected_d)
+        order = only_u + ud + only_d
+        order.extend(channel for channel in range(model.config.intermediate_size) if channel not in order)
+
+        if only_u or ud:
+            layer.mlp.up_proj = _replace_with_s2_column(
+                layer.mlp.up_proj,
+                start=0,
+                end=len(only_u) + len(ud),
+            )
+            replacements += 1
+        if only_d or ud:
+            layer.mlp.down_proj = _replace_with_s2_row(
+                layer.mlp.down_proj,
+                start=len(only_u),
+                end=len(only_u) + len(ud) + len(only_d),
+            )
+            replacements += 1
+
+        _reorder_rows_by_units(layer.mlp.up_proj, order)
+        _reorder_rows_by_units(layer.mlp.gate_proj, order)
+        _reorder_columns_by_units(layer.mlp.down_proj, order)
+    return replacements
+
+
+def _only_optimize_s2_parameters(model):
+    for name, param in model.named_parameters():
+        param.requires_grad = "s2" in name
+    return model
+
+
+def _restore_s2_linear_modules(model):
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, (S2ColumnLinear, S2RowLinear)):
             continue
-        if any(name.endswith(suffix) for suffix in ("q_proj", "k_proj", "v_proj")):
-            rows = []
-            for head in selected_heads.get(layer, []):
-                rows.extend(range(head * head_dim, (head + 1) * head_dim))
-            if rows:
-                name_to_indices[name] = _flat_indices_for_rows(module, rows)
-        elif name.endswith("o_proj"):
-            cols = []
-            for head in selected_heads.get(layer, []):
-                cols.extend(range(head * head_dim, (head + 1) * head_dim))
-            if cols:
-                name_to_indices[name] = _flat_indices_for_columns(module, cols)
-        elif name.endswith("gate_proj") or name.endswith("up_proj"):
-            rows = selected_channels.get(layer, [])
-            if rows:
-                name_to_indices[name] = _flat_indices_for_rows(module, rows)
-        elif name.endswith("down_proj"):
-            cols = selected_channels.get(layer, [])
-            if cols:
-                name_to_indices[name] = _flat_indices_for_columns(module, cols)
-
-    return name_to_indices
+        module.fuse_s2_weight()
+        new_linear = nn.Linear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            device=module.weight.device,
+            dtype=module.weight.dtype,
+        )
+        new_linear.weight.data.copy_(module.weight.data)
+        if module.bias is not None:
+            new_linear.bias.data.copy_(module.bias.data)
+        parent = model
+        parts = name.split(".")
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], new_linear)
+    return model
 
 
 def train_s2ft(
@@ -197,15 +396,20 @@ def train_s2ft(
     lr_scheduler_type="linear", max_seq_length=512, target_params=170_000_000,
     bf16=True, hf_token=None, seed=42, report_to="none",
     s2ft_calibration_steps=None, s2ft_calibration_batch_size=None,
+    s2ft_v_ratio=None, s2ft_o_ratio=None, s2ft_u_ratio=None, s2ft_d_ratio=None,
+    s2ft_selection_method=None,
     **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     tok_kwargs = {"token": hf_token} if hf_token else {}
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+        **tok_kwargs,
+    )
 
     with open(dataset_path) as f:
         raw = json.load(f)
@@ -216,55 +420,70 @@ def train_s2ft(
         s2ft_calibration_steps = int(os.environ.get("S2FT_CALIBRATION_STEPS", "100"))
     if s2ft_calibration_batch_size is None:
         s2ft_calibration_batch_size = int(os.environ.get("S2FT_CALIBRATION_BATCH_SIZE", "1"))
-    selection_method = os.environ.get("S2FT_SELECTION_METHOD", "small_activation")
+    selection_method = s2ft_selection_method or os.environ.get("S2FT_SELECTION_METHOD", "random")
     if torch.cuda.is_available():
         model.to(torch.device("cuda"))
 
-    num_layers = len({layer for layer in (_layer_id(n) for n, _ in model.named_modules()) if layer is not None})
-    num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
-    hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
-    head_dim = hidden_size // num_heads if num_heads else 0
-    intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
-    attn_unit_params = 4 * hidden_size * head_dim if head_dim else 0
-    ffn_unit_params = 3 * hidden_size
-    possible_params = num_layers * num_heads * attn_unit_params + num_layers * intermediate_size * ffn_unit_params
-    rate = min(target_params / possible_params, 1.0) if possible_params else 0.0
-    num_selected_heads = int(num_layers * num_heads * rate)
-    num_selected_channels = int(num_layers * intermediate_size * rate)
+    ratios, ratio_source = _resolve_ratios(
+        model=model,
+        target_params=target_params,
+        v_ratio=s2ft_v_ratio,
+        o_ratio=s2ft_o_ratio,
+        u_ratio=s2ft_u_ratio,
+        d_ratio=s2ft_d_ratio,
+    )
     logger.info(
-        f"[S2FT] selection_method={selection_method}, heads={num_selected_heads}, "
-        f"channels={num_selected_channels}, rate={rate:.6f}"
+        "[S2FT] selection_method=%s, ratio_source=%s, v_ratio=%.6f, o_ratio=%.6f, u_ratio=%.6f, d_ratio=%.6f",
+        selection_method,
+        ratio_source,
+        ratios["v"],
+        ratios["o"],
+        ratios["u"],
+        ratios["d"],
     )
 
-    attn_scores, ffn_scores, completed_calibration_steps = _collect_s2ft_activation_scores(
+    selected, completed_calibration_steps = _select_units(
         model=model,
         train_dataset=train_dataset,
+        ratios=ratios,
+        method=selection_method,
         calibration_steps=s2ft_calibration_steps,
         calibration_batch_size=s2ft_calibration_batch_size,
+        seed=seed,
     )
-    selected_heads = _choose_units(attn_scores, num_selected_heads, selection_method)
-    selected_channels = _choose_units(ffn_scores, num_selected_channels, selection_method)
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    name_to_indices = _build_s2ft_indices(model, selected_heads, selected_channels)
-    replacements = _replace_linear_with_indices(model, name_to_indices)
+    replacements = _convert_mha_layer_to_s2(model, selected)
+    replacements += _convert_ffn_layer_to_s2(model, selected)
+    _only_optimize_s2_parameters(model)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
-        f"[S2FT] replacements={replacements}, selected_heads={sum(len(v) for v in selected_heads.values())}, "
-        f"selected_channels={sum(len(v) for v in selected_channels.values())}, trainable={trainable:,}, "
-        f"completed_calibration_steps={completed_calibration_steps}"
+        "[S2FT] replacements=%d, selected_v=%d, selected_o=%d, selected_u=%d, selected_d=%d, "
+        "trainable=%d, completed_calibration_steps=%d",
+        replacements,
+        sum(len(v) for v in selected["v"].values()),
+        sum(len(v) for v in selected["o"].values()),
+        sum(len(v) for v in selected["u"].values()),
+        sum(len(v) for v in selected["d"].values()),
+        trainable,
+        completed_calibration_steps,
     )
     logger.info(f"[S2FT] weight_selection_seconds={time.time() - selection_start:.2f}")
 
     training_args = TrainingArguments(
-        output_dir=output_dir, num_train_epochs=num_train_epochs, max_steps=max_steps,
-        per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=learning_rate, lr_scheduler_type=lr_scheduler_type, bf16=bf16,
-        save_strategy="no" if 0 < max_steps < 100 else "epoch", logging_steps=5,
-        report_to=report_to, seed=seed, dataloader_num_workers=4, remove_unused_columns=False,
+        output_dir=output_dir,
+        num_train_epochs=num_train_epochs,
+        max_steps=max_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        lr_scheduler_type=lr_scheduler_type,
+        bf16=bf16,
+        save_strategy="no" if 0 < max_steps < 100 else "epoch",
+        logging_steps=5,
+        report_to=report_to,
+        seed=seed,
+        dataloader_num_workers=4,
+        remove_unused_columns=False,
         deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, tokenizer=tokenizer)
@@ -274,14 +493,7 @@ def train_s2ft(
         logger.info("[S2FT] RAPA_SKIP_SAVE=true; skipping model save for profiling")
         return output_dir
 
-    try:
-        from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
-    except ImportError:
-        try:
-            from .sift_tuner import restore_linear_modules
-        except ImportError:
-            from sift_tuner import restore_linear_modules
-    model = restore_linear_modules(model)
+    model = _restore_s2_linear_modules(model)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     logger.info(f"[S2FT] Model saved to {output_dir}")

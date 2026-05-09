@@ -41,6 +41,9 @@ GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-5}"
 GPU_MONITOR_LOG_INTERVAL="${GPU_MONITOR_LOG_INTERVAL:-60}"
 SYNC_LMFLOW="${SYNC_LMFLOW:-auto}"
 RESUME_TRAINING="${RESUME_TRAINING:-false}"
+CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-}"
+BASE_DS_CONFIG="${BASE_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
+OFFLOAD_DS_CONFIG="${OFFLOAD_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero2_offload.json}"
 SIFT_USE_GRADIENT_CALIBRATION="${SIFT_USE_GRADIENT_CALIBRATION:-true}"
 SIFT_CALIBRATION_ONLY="${SIFT_CALIBRATION_ONLY:-false}"
 SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
@@ -50,11 +53,12 @@ SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
 S2FT_CALIBRATION_STEPS="${S2FT_CALIBRATION_STEPS:-100}"
 S2FT_CALIBRATION_BATCH_SIZE="${S2FT_CALIBRATION_BATCH_SIZE:-1}"
 LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
+LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 export SIFT_CALIBRATION_STEPS SIFT_CALIBRATION_BATCH_SIZE
 export RESUME_TRAINING SIFT_USE_GRADIENT_CALIBRATION SIFT_CALIBRATION_ONLY
 export SMT_CALIBRATION_STEPS SMT_CALIBRATION_BATCH_SIZE
 export S2FT_CALIBRATION_STEPS S2FT_CALIBRATION_BATCH_SIZE
-export LTSFT_MASK_SEARCH_STEPS
+export LTSFT_MASK_SEARCH_STEPS LTSFT_N_FT_ITERATIONS
 
 if [ ! -f "${DATASET}" ]; then
     echo "Dataset not found: ${DATASET}"
@@ -115,6 +119,17 @@ sync_lmflow_sources() {
 
 sync_lmflow_sources
 
+method_uses_offload() {
+    local method="$1"
+    local item
+    for item in ${CPU_OFFLOAD_METHODS}; do
+        if [ "${item}" = "${method}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS_FILE}" ]; then
     {
         echo "# MMLU 20M Sparse FT Single-GPU Results"
@@ -127,6 +142,7 @@ if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS_FILE}" ]; then
         echo "- smt_calibration_steps: ${SMT_CALIBRATION_STEPS}"
         echo "- s2ft_calibration_steps: ${S2FT_CALIBRATION_STEPS}"
         echo "- ltsft_mask_search_steps: ${LTSFT_MASK_SEARCH_STEPS}"
+        echo "- ltsft_n_ft_iterations: ${LTSFT_N_FT_ITERATIONS}"
         echo "- smt_calibration_batch_size: ${SMT_CALIBRATION_BATCH_SIZE}"
         echo ""
     } > "${RESULTS_FILE}"
@@ -146,6 +162,7 @@ else
         echo "- smt_calibration_steps: ${SMT_CALIBRATION_STEPS}"
         echo "- s2ft_calibration_steps: ${S2FT_CALIBRATION_STEPS}"
         echo "- ltsft_mask_search_steps: ${LTSFT_MASK_SEARCH_STEPS}"
+        echo "- ltsft_n_ft_iterations: ${LTSFT_N_FT_ITERATIONS}"
         echo "- smt_calibration_batch_size: ${SMT_CALIBRATION_BATCH_SIZE}"
         echo "- started_at: $(date --iso-8601=seconds)"
     } >> "${RESULTS_FILE}"
@@ -271,6 +288,12 @@ for method in ${METHODS}; do
     echo "============================================"
     echo "[mmlu] Training ${method} on GPU ${GPU_INDEX} batch=${BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
     echo "============================================"
+    if method_uses_offload "${method}"; then
+        train_ds_config="${OFFLOAD_DS_CONFIG}"
+        echo "[mmlu] ${method} using CPU optimizer offload with unchanged batch=${BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
+    else
+        train_ds_config="${BASE_DS_CONFIG}"
+    fi
     port=$((29500 + RANDOM % 1000))
     train_start="$(date +%s)"
     train_peak_file="${log_dir}/train_peak_memory_mb.txt"
@@ -278,7 +301,7 @@ for method in ${METHODS}; do
     start_gpu_monitor "${train_peak_file}" "${train_stop_file}" "${log_dir}/train.log" "train" "${method}" "${train_start}" "$$"
 
     set +e
-        deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" \
+        DS_CONFIG="${train_ds_config}" deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" \
         "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py" \
         --method "${method}" \
         --model_name_or_path "${MODEL}" \
@@ -298,6 +321,7 @@ for method in ${METHODS}; do
         --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
         --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
         --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
+        --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
         --bf16 \
         --seed 42 \
         "${extra_args[@]}" \

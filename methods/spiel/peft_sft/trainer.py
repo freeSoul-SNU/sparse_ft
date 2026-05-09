@@ -37,6 +37,8 @@ def update_optimizer(
 
     optimizer_state = optimizer.state[param]
     for optim_aux in ['age', 'exp_avg', 'exp_avg_sq']:
+        if optim_aux not in optimizer_state:
+            continue
         optimizer_params = optimizer_state[optim_aux]
         init = init_momenta.get(optim_aux, None)
         if init is not None:

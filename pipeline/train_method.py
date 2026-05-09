@@ -51,8 +51,21 @@ def parse_args():
                    help="S2FT activation calibration steps before head/channel selection (default: env S2FT_CALIBRATION_STEPS or 100)")
     p.add_argument("--s2ft_calibration_batch_size", type=int, default=None,
                    help="S2FT activation calibration batch size (default: env S2FT_CALIBRATION_BATCH_SIZE or 1)")
+    p.add_argument("--s2ft_v_ratio", type=float, default=None,
+                   help="S2FT v_proj head ratio. If omitted, ratios are derived from target_params.")
+    p.add_argument("--s2ft_o_ratio", type=float, default=None,
+                   help="S2FT o_proj head ratio. If omitted, ratios are derived from target_params.")
+    p.add_argument("--s2ft_u_ratio", type=float, default=None,
+                   help="S2FT up_proj channel ratio. If omitted, ratios are derived from target_params.")
+    p.add_argument("--s2ft_d_ratio", type=float, default=None,
+                   help="S2FT down_proj channel ratio. If omitted, ratios are derived from target_params.")
+    p.add_argument("--s2ft_selection_method", type=str, default=None,
+                   choices=["random", "small_activation", "activation", "large_activation", "large"],
+                   help="S2FT structure selection method (default: env S2FT_SELECTION_METHOD or random)")
     p.add_argument("--ltsft_mask_search_steps", type=int, default=None,
                    help="LT-SFT dense lottery-ticket mask-search steps (default: env LTSFT_MASK_SEARCH_STEPS or 100)")
+    p.add_argument("--ltsft_n_ft_iterations", type=int, default=None,
+                   help="LT-SFT full/sparse fine-tuning iterations (default: env LTSFT_N_FT_ITERATIONS or 1)")
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--hf_token", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -123,8 +136,20 @@ def main():
         common_kwargs["s2ft_calibration_steps"] = args.s2ft_calibration_steps
     if args.s2ft_calibration_batch_size is not None:
         common_kwargs["s2ft_calibration_batch_size"] = args.s2ft_calibration_batch_size
+    if args.s2ft_v_ratio is not None:
+        common_kwargs["s2ft_v_ratio"] = args.s2ft_v_ratio
+    if args.s2ft_o_ratio is not None:
+        common_kwargs["s2ft_o_ratio"] = args.s2ft_o_ratio
+    if args.s2ft_u_ratio is not None:
+        common_kwargs["s2ft_u_ratio"] = args.s2ft_u_ratio
+    if args.s2ft_d_ratio is not None:
+        common_kwargs["s2ft_d_ratio"] = args.s2ft_d_ratio
+    if args.s2ft_selection_method is not None:
+        common_kwargs["s2ft_selection_method"] = args.s2ft_selection_method
     if args.ltsft_mask_search_steps is not None:
         common_kwargs["ltsft_mask_search_steps"] = args.ltsft_mask_search_steps
+    if args.ltsft_n_ft_iterations is not None:
+        common_kwargs["ltsft_n_ft_iterations"] = args.ltsft_n_ft_iterations
     # Inject max_steps into TrainingArguments via env
     if max_steps > 0:
         os.environ["RAPA_MAX_STEPS"] = str(max_steps)
