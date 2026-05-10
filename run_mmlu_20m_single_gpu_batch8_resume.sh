@@ -45,6 +45,10 @@ CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-}"
 BASE_DS_CONFIG="${BASE_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
 OFFLOAD_DS_CONFIG="${OFFLOAD_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero2_offload.json}"
 SIFT_USE_GRADIENT_CALIBRATION="${SIFT_USE_GRADIENT_CALIBRATION:-true}"
+SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
+SIFT_HOOK_ZERO_DENSE_GRAD="${SIFT_HOOK_ZERO_DENSE_GRAD:-true}"
+SIFT_HOOK_STRIP_DS_OPTIMIZER="${SIFT_HOOK_STRIP_DS_OPTIMIZER:-true}"
+SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
 SIFT_CALIBRATION_ONLY="${SIFT_CALIBRATION_ONLY:-false}"
 SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
 SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"
@@ -56,6 +60,7 @@ LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 export SIFT_CALIBRATION_STEPS SIFT_CALIBRATION_BATCH_SIZE
 export RESUME_TRAINING SIFT_USE_GRADIENT_CALIBRATION SIFT_CALIBRATION_ONLY
+export SIFT_IMPLEMENTATION SIFT_HOOK_ZERO_DENSE_GRAD SIFT_HOOK_STRIP_DS_OPTIMIZER SIFT_HOOK_USE_DEEPSPEED
 export SMT_CALIBRATION_STEPS SMT_CALIBRATION_BATCH_SIZE
 export S2FT_CALIBRATION_STEPS S2FT_CALIBRATION_BATCH_SIZE
 export LTSFT_MASK_SEARCH_STEPS LTSFT_N_FT_ITERATIONS
@@ -299,34 +304,41 @@ for method in ${METHODS}; do
     train_peak_file="${log_dir}/train_peak_memory_mb.txt"
     train_stop_file="${log_dir}/train_peak_memory.stop"
     start_gpu_monitor "${train_peak_file}" "${train_stop_file}" "${log_dir}/train.log" "train" "${method}" "${train_start}" "$$"
+    train_args=(
+        "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py"
+        --method "${method}"
+        --model_name_or_path "${MODEL}"
+        --dataset_path "${DATASET}"
+        --output_dir "${ckpt}"
+        --num_train_epochs "${EPOCHS}"
+        --per_device_train_batch_size "${BATCH_SIZE}"
+        --gradient_accumulation_steps "${GRAD_ACCUM}"
+        --learning_rate "${LEARNING_RATE}"
+        --lr_scheduler_type cosine
+        --max_seq_length "${MAX_SEQ_LENGTH}"
+        --target_params "${TARGET_PARAMS}"
+        --sift_calibration_steps "${SIFT_CALIBRATION_STEPS}"
+        --sift_calibration_batch_size "${SIFT_CALIBRATION_BATCH_SIZE}"
+        --smt_calibration_steps "${SMT_CALIBRATION_STEPS}"
+        --smt_calibration_batch_size "${SMT_CALIBRATION_BATCH_SIZE}"
+        --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}"
+        --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}"
+        --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}"
+        --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}"
+        --bf16
+        --seed 42
+        "${extra_args[@]}"
+    )
 
     set +e
-        DS_CONFIG="${train_ds_config}" deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" \
-        "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py" \
-        --method "${method}" \
-        --model_name_or_path "${MODEL}" \
-        --dataset_path "${DATASET}" \
-        --output_dir "${ckpt}" \
-        --num_train_epochs "${EPOCHS}" \
-        --per_device_train_batch_size "${BATCH_SIZE}" \
-        --gradient_accumulation_steps "${GRAD_ACCUM}" \
-        --learning_rate "${LEARNING_RATE}" \
-        --lr_scheduler_type cosine \
-        --max_seq_length "${MAX_SEQ_LENGTH}" \
-        --target_params "${TARGET_PARAMS}" \
-        --sift_calibration_steps "${SIFT_CALIBRATION_STEPS}" \
-        --sift_calibration_batch_size "${SIFT_CALIBRATION_BATCH_SIZE}" \
-        --smt_calibration_steps "${SMT_CALIBRATION_STEPS}" \
-        --smt_calibration_batch_size "${SMT_CALIBRATION_BATCH_SIZE}" \
-        --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
-        --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
-        --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
-        --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
-        --bf16 \
-        --seed 42 \
-        "${extra_args[@]}" \
-        2>&1 | tee "${log_dir}/train.log"
-    train_ec=${PIPESTATUS[0]}
+    if [ "${method}" = "sift" ] && [ "${SIFT_IMPLEMENTATION}" = "hook" ] && [[ ! "${SIFT_HOOK_USE_DEEPSPEED,,}" =~ ^(1|true|yes)$ ]]; then
+        echo "[mmlu] sift hook mode: running without DeepSpeed/CPU offload on single GPU" | tee "${log_dir}/train.log"
+        DS_CONFIG=false CUDA_VISIBLE_DEVICES="${GPU_INDEX}" python "${train_args[@]}" 2>&1 | tee -a "${log_dir}/train.log"
+        train_ec=${PIPESTATUS[0]}
+    else
+        DS_CONFIG="${train_ds_config}" deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" "${train_args[@]}" 2>&1 | tee "${log_dir}/train.log"
+        train_ec=${PIPESTATUS[0]}
+    fi
     set -e
 
     train_elapsed=$(( $(date +%s) - train_start ))
@@ -338,7 +350,7 @@ for method in ${METHODS}; do
             calibration_peak_gpu="$(log_metric_value "${log_dir}/train.log" "calibration_peak_reserved_mb" || true)"
             calibration_peak_cpu="$(log_metric_value "${log_dir}/train.log" "calibration_peak_cpu_rss_mb" || true)"
             if [ -n "${calibration_elapsed}" ]; then
-                echo -e "${method}\tcalibration\t${calibration_elapsed}\t${calibration_peak_gpu:-}\t${calibration_peak_cpu:-}\t${SIFT_CALIBRATION_BATCH_SIZE}\t\t${train_ec}" >> "${METRICS_FILE}"
+                echo -e "${method}\tcalibration\t${calibration_elapsed}\t${calibration_peak_gpu:-0}\t${calibration_peak_cpu:-0}\t${SIFT_CALIBRATION_BATCH_SIZE}\t${GRAD_ACCUM}\t${train_ec}" >> "${METRICS_FILE}"
             fi
         fi
 

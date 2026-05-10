@@ -53,9 +53,12 @@ case "${PROFILE_GPU}" in
         ;;
 esac
 
-# For 13B + 501M, optimizer states can dominate memory. Start all methods with CPU
-# optimizer offload; set CPU_OFFLOAD_METHODS='' only if you intentionally want no-offload.
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-sift smt ltsft spiel s2ft}"
+# Use the paper-like SIFT hook path by default. It is single-GPU/no-DeepSpeed
+# unless SIFT_HOOK_USE_DEEPSPEED=true is set; other 13B/501M methods keep CPU
+# optimizer offload by default.
+export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
+export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
 export ENABLE_OFFLOAD_RETRY="${ENABLE_OFFLOAD_RETRY:-true}"
 
 # Match SMT's selection space to the other methods.

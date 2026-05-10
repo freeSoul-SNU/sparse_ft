@@ -12,6 +12,7 @@ set -euo pipefail
 #
 # Optional examples:
 #   METHODS="sift smt" RUN_EVAL=false CUDA_VISIBLE_DEVICES=1 bash run_mmlu_501m_13b_single_gpu.sh
+#   METHODS=sift RUN_EVAL=true RESET_RESULTS=true bash run_mmlu_501m_13b_single_gpu.sh
 #   HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 bash run_mmlu_501m_13b_single_gpu.sh
 
 SPARSE_FT_ROOT="${SPARSE_FT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -50,10 +51,11 @@ export GRAD_ACCUM="${GRAD_ACCUM:-2}"
 export LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 
 # 13B + 501M trainable parameters can exceed a single A100's memory once
-# optimizer states are included.  Use the same CPU optimizer offload path as
-# the profiling scripts by default; override to CPU_OFFLOAD_METHODS='' only
-# when intentionally testing the no-offload path.
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-sift smt ltsft spiel s2ft}"
+# optimizer states are included.  Most methods use the CPU optimizer offload
+# path by default.  SIFT defaults to the paper-like hook implementation below,
+# which optimizes only sparse parameters on a single GPU and does not use
+# DeepSpeed/offload unless SIFT_HOOK_USE_DEEPSPEED=true is explicitly set.
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
 
 # Actual fine-tuning script defaults to train+eval.
 # Set RUN_EVAL=false if you only want fine-tuning.
@@ -63,6 +65,10 @@ export RUN_EVAL="${RUN_EVAL:-true}"
 # Calibration / mask-search defaults inherited from the 20M script.
 # Override if needed.
 export SIFT_USE_GRADIENT_CALIBRATION="${SIFT_USE_GRADIENT_CALIBRATION:-true}"
+export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
+export SIFT_HOOK_ZERO_DENSE_GRAD="${SIFT_HOOK_ZERO_DENSE_GRAD:-true}"
+export SIFT_HOOK_STRIP_DS_OPTIMIZER="${SIFT_HOOK_STRIP_DS_OPTIMIZER:-true}"
+export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
 export SIFT_CALIBRATION_ONLY="${SIFT_CALIBRATION_ONLY:-false}"
 export SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
 export SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"
@@ -93,6 +99,8 @@ echo "[run] METHODS=${METHODS}"
 echo "[run] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[run] BATCH_SIZE=${BATCH_SIZE}"
 echo "[run] GRAD_ACCUM=${GRAD_ACCUM}"
+echo "[run] SIFT_IMPLEMENTATION=${SIFT_IMPLEMENTATION}"
+echo "[run] SIFT_HOOK_USE_DEEPSPEED=${SIFT_HOOK_USE_DEEPSPEED}"
 echo "[run] CPU_OFFLOAD_METHODS=${CPU_OFFLOAD_METHODS}"
 echo "[run] RESULT_ROOT=${RESULT_ROOT}"
 

@@ -33,9 +33,12 @@ export MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"
 export GPU0_METHODS="${GPU0_METHODS:-sift smt ltsft}"
 export GPU1_METHODS="${GPU1_METHODS:-spiel s2ft}"
 
-# For 13B + 501M, optimizer states can dominate memory. Start all methods with CPU
-# optimizer offload; users can override this to an empty string to measure no-offload first.
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-sift smt ltsft spiel s2ft}"
+# Use the paper-like SIFT hook path by default. It is single-GPU/no-DeepSpeed
+# unless SIFT_HOOK_USE_DEEPSPEED=true is set; other 13B/501M methods keep CPU
+# optimizer offload by default.
+export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
+export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
 export ENABLE_OFFLOAD_RETRY="${ENABLE_OFFLOAD_RETRY:-true}"
 
 # Match SMT's selection space to the other methods. smt_tuner.py otherwise defaults to

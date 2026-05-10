@@ -6,7 +6,7 @@
 
 | Method | Paper/Repo | Sparsity Type | Description |
 |--------|-----------|---------------|-------------|
-| **SIFT** | [song-wx/SIFT](https://github.com/song-wx/SIFT) | Gradient top-k element-wise | calibration gradient의 absolute value 상위 weight element를 선택하여 학습 |
+| **SIFT** | [song-wx/SIFT](https://github.com/song-wx/SIFT) | Gradient top-k element-wise | hook 기반 sparse parameter optimizer를 사용하고, calibration gradient의 absolute value 상위 weight element를 선택하여 학습 |
 | **SpiEL** | [ducdauge/sft-llm](https://github.com/ducdauge/sft-llm) + [AlanAnsell/peft](https://github.com/AlanAnsell/peft) | Dynamic scatter sparse | RigL/SM3 기반 prune-regrow selection으로 sparse delta 위치를 재선택하며 학습 |
 | **SMT** | [HectorHHZ/Sparse_Matrix_Tuning](https://github.com/HectorHHZ/Sparse_Matrix_Tuning) | Block-sparse (256x256) | calibration gradient score 상위 256x256 block을 선택하여 학습 |
 | **S2FT** | [Infini-AI-Lab/S2FT](https://github.com/Infini-AI-Lab/S2FT) | Structured heads/channels | random 또는 score 기반으로 attention head와 FFN channel을 선택하고, coupled row/column co-permutation 후 dense submatrix를 학습 |
@@ -19,14 +19,14 @@
 ```
 sparse_ft/
 ├── methods/           # 각 method의 원본 코드 (수정 포함)
-│   ├── sift/         # SIFT - SparseLinear + index cache
+│   ├── sift/         # SIFT - author-style hook path + SparseLinear fallback
 │   ├── spiel/        # SpiEL - AlanAnsell peft fork
 │   ├── smt/          # SMT - BlockSparseLinear
 │   ├── s2ft/         # S2FT - structured head/channel selection
 │   └── ltsft/        # LT-SFT - SparseLinear (lottery ticket)
 ├── pipeline/          # LMFlow 통합 파이프라인
 │   ├── __init__.py
-│   ├── sift_tuner.py  # SIFT: frozen weight(buffer) + sparse_delta(Parameter)
+│   ├── sift_tuner.py  # SIFT: hook sparse optimizer 또는 SparseLinear fallback
 │   ├── spiel_tuner.py # SpiEL: peft fork SftConfig + merge_and_unload
 │   ├── smt_tuner.py   # SMT: BlockSparseLinear (256x256 blocks)
 │   ├── s2ft_tuner.py  # S2FT: structured attention-head / FFN-channel selection
@@ -105,6 +105,20 @@ tail -f /data/nksol0405/LLM/rapa/results/results.md
 cd /home/nksol0405/LLM/sparse_ft
 METHODS=sift bash run_mmlu_20m_single_gpu.sh
 ```
+
+### 13B / 501M SIFT
+```bash
+# 100-step train-phase profile on GPU 1
+bash scripts/profile_sift_hook_13b_501m_train_phase.sh
+
+# Full MMLU training + lm-eval on GPU 1
+METHODS=sift RUN_EVAL=true RESET_RESULTS=true bash run_mmlu_501m_13b_single_gpu.sh
+```
+
+13B/501M SIFT는 기본적으로 `SIFT_IMPLEMENTATION=hook`,
+`SIFT_HOOK_USE_DEEPSPEED=false`로 실행한다. 이는 원저자 구현처럼 원래
+Linear weight를 유지하고 backward hook으로 sparse gradient만 optimizer
+parameter에 전달한 뒤 step마다 원래 weight에 merge하는 경로다.
 
 ## Hyperparameters
 

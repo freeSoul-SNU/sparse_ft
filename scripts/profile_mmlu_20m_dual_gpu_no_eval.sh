@@ -51,6 +51,10 @@ export PYTHONPATH="${LMFLOW_DIR}/src:${SPARSE_FT_ROOT}:${PYTHONPATH:-}"
 export RAPA_SKIP_SAVE="${RAPA_SKIP_SAVE:-true}"
 export RESUME_TRAINING="${RESUME_TRAINING:-false}"
 export SIFT_USE_GRADIENT_CALIBRATION="${SIFT_USE_GRADIENT_CALIBRATION:-true}"
+export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
+export SIFT_HOOK_ZERO_DENSE_GRAD="${SIFT_HOOK_ZERO_DENSE_GRAD:-true}"
+export SIFT_HOOK_STRIP_DS_OPTIMIZER="${SIFT_HOOK_STRIP_DS_OPTIMIZER:-true}"
+export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
 export SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
 export SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"
 export SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
@@ -313,9 +317,8 @@ run_one_attempt() {
     (
         cd "${LMFLOW_DIR}"
         export CUDA_VISIBLE_DEVICES="${gpu}"
-        export DS_CONFIG="${ds_config}"
-        deepspeed --include=localhost:"${gpu}" --master_port="${port}" \
-            "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py" \
+        train_args=(
+            "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py"
             --method "${method}" \
             --model_name_or_path "${MODEL}" \
             --dataset_path "${DATASET}" \
@@ -339,6 +342,14 @@ run_one_attempt() {
             --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
             --bf16 \
             --seed 42
+        )
+        if [ "${method}" = "sift" ] && [ "${SIFT_IMPLEMENTATION}" = "hook" ] && [[ ! "${SIFT_HOOK_USE_DEEPSPEED,,}" =~ ^(1|true|yes)$ ]]; then
+            echo "[profile] sift hook mode: running without DeepSpeed/CPU offload on GPU ${gpu}"
+            DS_CONFIG=false python "${train_args[@]}"
+        else
+            export DS_CONFIG="${ds_config}"
+            deepspeed --include=localhost:"${gpu}" --master_port="${port}" "${train_args[@]}"
+        fi
     ) > "${log_file}" 2>&1 &
     train_pid="$!"
     monitor_pid="$(start_monitor "${train_pid}" "${gpu}" "${monitor_file}" "${output_dir}")"

@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import json
+import tempfile
 import time
 import threading
 
@@ -19,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
+from transformers import Trainer, TrainerCallback, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ SIFT_PATH = os.environ.get("SIFT_PATH", os.path.join(SPARSE_FT_ROOT, "methods", 
 if SIFT_PATH not in sys.path:
     sys.path.insert(0, SIFT_PATH)
 
-from sift import SIFT  # noqa: E402
+from sift import HookSIFT, SIFT  # noqa: E402
 
 
 def _deepspeed_config(default_path):
@@ -41,6 +42,30 @@ def _deepspeed_config(default_path):
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
+
+
+def _external_optimizer_deepspeed_config(default_path, output_dir):
+    value = _deepspeed_config(default_path)
+    if value is None:
+        return None
+    if os.environ.get("SIFT_HOOK_STRIP_DS_OPTIMIZER", "true").lower() not in {"1", "true", "yes"}:
+        return value
+    with open(value) as f:
+        config = json.load(f)
+    # Hook SIFT must control the optimizer parameter list so dense base weights
+    # do not become optimizer/ZeRO state.  Removing these sections makes
+    # Transformers pass the custom sparse-parameter optimizer to DeepSpeed.
+    config.pop("optimizer", None)
+    config.pop("scheduler", None)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="ds_sift_hook_external_optimizer_", suffix=".json", dir=output_dir)
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f, indent=4)
+    return path
+
+
+def _dataloader_num_workers():
+    return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
 
 
 def _read_self_rss_mb():
@@ -74,6 +99,52 @@ class PeakRSSMonitor:
         self._stop.set()
         self._thread.join()
         return self.peak_mb
+
+
+class SIFTHookTrainer(Trainer):
+    """Trainer that optimizes only HookSIFT sparse parameters."""
+
+    def __init__(self, *args, sift_obj=None, **kwargs):
+        self.sift_obj = sift_obj
+        super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+        if self.sift_obj is None:
+            return super().create_optimizer()
+
+        named_params = list(self.sift_obj.named_parameters_in_optimizer())
+        decay_params = []
+        no_decay_params = []
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            if name.endswith("bias") or "layer_norm" in name.lower() or "norm" in name.lower():
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        optimizer_grouped_parameters = [
+            {"params": decay_params, "weight_decay": self.args.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        self.optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=self.args.learning_rate,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+            eps=self.args.adam_epsilon,
+        )
+        return self.optimizer
+
+
+class SIFTHookMergeCallback(TrainerCallback):
+    def __init__(self, sift_obj):
+        self.sift_obj = sift_obj
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self.sift_obj.merge_sparse_updates()
+        return control
 
 
 def restore_linear_modules(model):
@@ -336,6 +407,10 @@ def train_sift(
 
     if sparse_modules is None:
         sparse_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    sift_implementation = os.environ.get("SIFT_IMPLEMENTATION", "sparse_linear").lower()
+    if sift_implementation not in {"sparse_linear", "hook"}:
+        raise ValueError("SIFT_IMPLEMENTATION must be one of: sparse_linear, hook")
+    logger.info(f"[SIFT] implementation={sift_implementation}")
 
     tok_kwargs = {"token": hf_token} if hf_token else {}
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
@@ -426,34 +501,84 @@ def train_sift(
             )
             logger.info(f"[SIFT] Calibration-only complete. Saved indices to {indices_path}")
             return output_dir
-        sift_obj = type("SiftSelection", (), {"sparse_indices": sparse_indices})()
+        if sift_implementation == "hook":
+            zero_dense_grad = os.environ.get("SIFT_HOOK_ZERO_DENSE_GRAD", "true").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            sift_obj = HookSIFT(
+                model=model,
+                sparse_rate=sparse_rate,
+                sparse_module=sparse_modules,
+                grad_acc=gradient_accumulation_steps,
+                sparse_indices=sparse_indices,
+                zero_dense_grad=zero_dense_grad,
+            )
+            sift_obj.print_trainable_parameters()
+        else:
+            sift_obj = type("SiftSelection", (), {"sparse_indices": sparse_indices})()
     else:
         dataset_tag = os.path.basename(dataset_path).replace(".json", "")
-        sift_obj = SIFT(
-            model=model,
-            sparse_rate=sparse_rate,
-            sparse_module=sparse_modules,
-            grad_acc=gradient_accumulation_steps,
-            model_name=model_name_or_path,
-            seed=seed,
-            dataset_name=dataset_tag,
-        )
+        if sift_implementation == "hook":
+            zero_dense_grad = os.environ.get("SIFT_HOOK_ZERO_DENSE_GRAD", "true").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            sift_obj = HookSIFT(
+                model=model,
+                sparse_rate=sparse_rate,
+                sparse_module=sparse_modules,
+                grad_acc=gradient_accumulation_steps,
+                sparse_indices=None,
+                zero_dense_grad=zero_dense_grad,
+            )
+        else:
+            sift_obj = SIFT(
+                model=model,
+                sparse_rate=sparse_rate,
+                sparse_module=sparse_modules,
+                grad_acc=gradient_accumulation_steps,
+                model_name=model_name_or_path,
+                seed=seed,
+                dataset_name=dataset_tag,
+            )
         sift_obj.print_trainable_parameters()
 
-    for param in model.parameters():
-        param.requires_grad = False
+    if sift_implementation == "hook":
+        logger.info("[SIFT] Using hook-backed sparse parameters; keeping original Linear modules")
+    else:
+        for param in model.parameters():
+            param.requires_grad = False
 
-    # Replace target Linear with SparseLinear
-    model = replace_with_sparse_linear(model, sift_obj, sparse_modules)
+        # Replace target Linear with SparseLinear
+        model = replace_with_sparse_linear(model, sift_obj, sparse_modules)
     selection_elapsed = time.time() - selection_start
 
-    # Verify trainable params
+    # Verify trainable params.  Hook mode keeps original weights requiring grad
+    # so backward hooks can read dense gradients, but the optimizer still only
+    # sees SIFT's sparse parameters.
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    logger.info(f"[SIFT] After replacement: trainable={trainable:,}, total={total:,}")
+    if sift_implementation == "hook":
+        logger.info(f"[SIFT] autograd_trainable_for_hooks={trainable:,}, total={total:,}")
+        logger.info(f"[SIFT] optimizer_trainable={sift_obj.get_trainable_num():,}")
+    else:
+        logger.info(f"[SIFT] After replacement: trainable={trainable:,}, total={total:,}")
     logger.info(f"[SIFT] weight_selection_seconds={selection_elapsed:.2f}")
 
     save_strategy = "no" if 0 < max_steps < 100 else "epoch"
+    if sift_implementation == "hook":
+        if os.environ.get("SIFT_HOOK_USE_DEEPSPEED", "false").lower() in {"1", "true", "yes"}:
+            ds_config = _external_optimizer_deepspeed_config(
+                os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json"),
+                output_dir,
+            )
+        else:
+            ds_config = None
+    else:
+        ds_config = _deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json"))
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_train_epochs,
@@ -467,17 +592,27 @@ def train_sift(
         logging_steps=5,
         report_to=report_to,
         seed=seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=_dataloader_num_workers(),
         remove_unused_columns=False,
-        deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
+        deepspeed=ds_config,
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        tokenizer=tokenizer,
-    )
+    if sift_implementation == "hook":
+        trainer = SIFTHookTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+            sift_obj=sift_obj,
+            callbacks=[SIFTHookMergeCallback(sift_obj)],
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+        )
 
     resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}
     existing_checkpoint = get_last_checkpoint(output_dir)
@@ -491,7 +626,11 @@ def train_sift(
         return output_dir
 
     # Restore SparseLinear → nn.Linear (clean model for vLLM/HF loading)
-    model = restore_linear_modules(model)
+    if sift_implementation == "hook":
+        sift_obj.merge_sparse_updates()
+        sift_obj.remove_sparse_parameters()
+    else:
+        model = restore_linear_modules(model)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     logger.info(f"[SIFT] Model saved to {output_dir}")
