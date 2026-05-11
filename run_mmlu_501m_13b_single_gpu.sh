@@ -82,9 +82,13 @@ export LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 export LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 export RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
 
-# For fairer SMT comparison: include attention + MLP projections.
-# The SMT implementation reads this environment variable.
-export SMT_TARGET_MODULES="${SMT_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+# SMT official PEFT example uses q/k/v attention submatrices by default
+# (--num_submatrix_mlp 0, --target_modules q_proj/k_proj/v_proj).
+# Override SMT_BUDGET_ALLOCATION or SMT_NUM_SUBMATRIX_* for other paper variants.
+export SMT_TARGET_MODULES="${SMT_TARGET_MODULES:-q_proj,k_proj,v_proj}"
+export SMT_SELECTION_STRATEGY="${SMT_SELECTION_STRATEGY:-no_restriction}"
+export SMT_CALCULATION_STRATEGY="${SMT_CALCULATION_STRATEGY:-mean_abs}"
+export SMT_BUDGET_ALLOCATION="${SMT_BUDGET_ALLOCATION:-attention_only}"
 
 # Useful defaults
 export RESET_RESULTS="${RESET_RESULTS:-false}"

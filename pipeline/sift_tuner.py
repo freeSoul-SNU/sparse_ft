@@ -174,9 +174,12 @@ def restore_linear_modules(model):
         if isinstance(module, sparse_types):
             # Merge delta into weight
             with torch.no_grad():
-                delta_flat = torch.zeros(module.weight.numel(), dtype=module.weight.dtype, device=module.weight.device)
-                delta_flat.scatter_(0, module.flat_idx, module.sparse_delta.data.to(module.weight.dtype))
-                merged_weight = module.weight.data + delta_flat.view(module.weight.shape)
+                if hasattr(module, "merge_and_get_weight"):
+                    merged_weight = module.merge_and_get_weight()
+                else:
+                    delta_flat = torch.zeros(module.weight.numel(), dtype=module.weight.dtype, device=module.weight.device)
+                    delta_flat.scatter_(0, module.flat_idx, module.sparse_delta.data.to(module.weight.dtype))
+                    merged_weight = module.weight.data + delta_flat.view(module.weight.shape)
 
             # Create clean nn.Linear
             new_linear = nn.Linear(module.in_features, module.out_features,

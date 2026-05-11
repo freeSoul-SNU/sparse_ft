@@ -41,9 +41,11 @@ export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
 export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
 export ENABLE_OFFLOAD_RETRY="${ENABLE_OFFLOAD_RETRY:-true}"
 
-# Match SMT's selection space to the other methods. smt_tuner.py otherwise defaults to
-# attention projections only, while the other methods target attention + MLP projections.
-# export SMT_TARGET_MODULES="${SMT_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+# Match the official SMT PEFT example by default.
+export SMT_TARGET_MODULES="${SMT_TARGET_MODULES:-q_proj,k_proj,v_proj}"
+export SMT_SELECTION_STRATEGY="${SMT_SELECTION_STRATEGY:-no_restriction}"
+export SMT_CALCULATION_STRATEGY="${SMT_CALCULATION_STRATEGY:-mean_abs}"
+export SMT_BUDGET_ALLOCATION="${SMT_BUDGET_ALLOCATION:-attention_only}"
 
 # Keep calibration microbatches small for memory profiling on 13B.
 export SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"

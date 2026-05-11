@@ -1,14 +1,17 @@
-"""SMT (Sparse Matrix Tuning) with gradient-calibrated block selection.
+"""SMT (Sparse Matrix Tuning) with author-code-style block selection.
 
-Uses the same buffer + sparse delta approach as SIFT for DeepSpeed compatibility.
-Before fine-tuning, SMT runs a short calibration pass, scores 256x256 blocks by
-their accumulated weight-gradient magnitude, then trains only the selected blocks.
+SMT first runs a short dense warmup/calibration phase, accumulates gradients for
+candidate linear weights, selects 256x256 submatrices, and fine-tunes only those
+selected submatrices.  The default path follows the official PEFT example:
+attention-only q/k/v blocks, no-restriction global top-k within the attention
+group, and the author's mean(abs-after-block-mean) score.
 """
 import heapq
 import logging
 import os
 import sys
 import json
+import re
 import time
 
 import torch
@@ -32,41 +35,84 @@ def _deepspeed_config(default_path):
 
 
 class BlockSparseLinear(nn.Module):
-    """Linear with block-sparse trainable delta (SMT-style)."""
+    """Author-style SMT Linear: optimize selected 256x256 weight blocks only."""
 
     def __init__(self, orig_linear: nn.Linear, selected_blocks):
         super().__init__()
         self.in_features = orig_linear.in_features
         self.out_features = orig_linear.out_features
-
-        self.register_buffer("weight", orig_linear.weight.data)
+        self.weight = nn.Parameter(orig_linear.weight.detach().clone(), requires_grad=False)
         if orig_linear.bias is not None:
-            self.register_buffer("bias", orig_linear.bias.data)
+            self.register_buffer("bias", orig_linear.bias.detach().clone())
         else:
             self.bias = None
 
-        flat_indices = []
-        for rb, cb in selected_blocks:
-            r_start = rb * BLOCK_DIM
-            c_start = cb * BLOCK_DIM
-            for r in range(r_start, min(r_start + BLOCK_DIM, self.out_features)):
-                for c in range(c_start, min(c_start + BLOCK_DIM, self.in_features)):
-                    flat_indices.append(r * self.in_features + c)
-
-        flat_idx = torch.tensor(flat_indices, dtype=torch.long, device=self.weight.device)
-        self.register_buffer("flat_idx", flat_idx)
-        self.sparse_delta = nn.Parameter(
-            torch.zeros(len(flat_idx), dtype=self.weight.dtype, device=self.weight.device),
-            requires_grad=True,
+        self.index_list = [(int(rb), int(cb)) for rb, cb in selected_blocks]
+        selected_weight = torch.empty(
+            len(self.index_list) * BLOCK_DIM,
+            BLOCK_DIM,
+            dtype=self.weight.dtype,
+            device=self.weight.device,
         )
+        for i, (rb, cb) in enumerate(self.index_list):
+            selected_weight[i * BLOCK_DIM:(i + 1) * BLOCK_DIM, :] = self.weight.data[
+                rb * BLOCK_DIM:(rb + 1) * BLOCK_DIM,
+                cb * BLOCK_DIM:(cb + 1) * BLOCK_DIM,
+            ]
+        self.selected_weight = nn.Parameter(selected_weight, requires_grad=True)
+
+    def _merge_selected_weight_(self):
+        with torch.no_grad():
+            for i, (rb, cb) in enumerate(self.index_list):
+                self.weight.data[
+                    rb * BLOCK_DIM:(rb + 1) * BLOCK_DIM,
+                    cb * BLOCK_DIM:(cb + 1) * BLOCK_DIM,
+                ] = self.selected_weight.data[i * BLOCK_DIM:(i + 1) * BLOCK_DIM, :]
 
     def forward(self, x):
-        delta_flat = torch.zeros(
-            self.weight.numel(), dtype=self.sparse_delta.dtype, device=self.sparse_delta.device
+        self._merge_selected_weight_()
+        out = _SMTLinearFn.apply(x, self.selected_weight, self.index_list, self.weight)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def merge_and_get_weight(self):
+        self._merge_selected_weight_()
+        return self.weight.data
+
+
+class _SMTLinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_tensor, selected_weight, index_list, weight):
+        input_blocks = [
+            input_tensor[:, :, cb * BLOCK_DIM:(cb + 1) * BLOCK_DIM]
+            for _, cb in index_list
+        ]
+        ctx.input_blocks = input_blocks
+        ctx.index_list = index_list
+        ctx.save_for_backward(weight)
+        return torch.matmul(input_tensor, weight.t())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (weight,) = ctx.saved_tensors
+        grad_weight = torch.empty(
+            len(ctx.input_blocks) * BLOCK_DIM,
+            BLOCK_DIM,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
         )
-        delta_flat.scatter_(0, self.flat_idx, self.sparse_delta)
-        delta = delta_flat.view(self.weight.shape)
-        return F.linear(x, self.weight + delta, self.bias)
+        grad_output_t = grad_output.permute(0, 2, 1)
+        for i, ((rb, _), input_block) in enumerate(zip(ctx.index_list, ctx.input_blocks)):
+            grad_weight[i * BLOCK_DIM:(i + 1) * BLOCK_DIM, :] = torch.sum(
+                torch.matmul(
+                    grad_output_t[:, rb * BLOCK_DIM:(rb + 1) * BLOCK_DIM, :],
+                    input_block,
+                ),
+                dim=0,
+            )
+        grad_input = torch.matmul(grad_output, weight)
+        return grad_input, grad_weight, None, None
 
 
 def find_target_linear_layers(model, target_modules):
@@ -75,6 +121,100 @@ def find_target_linear_layers(model, target_modules):
         for name, module in model.named_modules()
         if isinstance(module, nn.Linear) and any(t in name for t in target_modules)
     }
+
+
+def _parse_csv_env(name, default):
+    return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
+
+
+def _env_int(name):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _dataloader_num_workers():
+    return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
+
+
+_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _module_short_name(name):
+    return name.rsplit(".", 1)[-1]
+
+
+def _layer_number(name):
+    match = _LAYER_RE.search(f".{name}.")
+    return int(match.group(1)) if match else -1
+
+
+def split_smt_candidate_layers(model, attention_modules, mlp_modules):
+    attention_layers = {}
+    mlp_layers = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        short = _module_short_name(name)
+        if "self_attn" in name and short in attention_modules:
+            attention_layers[name] = module
+        elif "mlp" in name and short in mlp_modules:
+            mlp_layers[name] = module
+    return attention_layers, mlp_layers
+
+
+def _available_blocks(layers):
+    return sum(
+        (module.out_features // BLOCK_DIM) * (module.in_features // BLOCK_DIM)
+        for module in layers.values()
+    )
+
+
+def compute_smt_block_budgets(attention_layers, mlp_layers, target_params):
+    """Derive official num_submatrix_attn/mlp-style budgets from target_params."""
+    params_per_block = BLOCK_DIM * BLOCK_DIM
+    requested_total = max(1, target_params // params_per_block)
+    available_attn = _available_blocks(attention_layers)
+    available_mlp = _available_blocks(mlp_layers)
+
+    explicit_attn = _env_int("SMT_NUM_SUBMATRIX_ATTN")
+    explicit_mlp = _env_int("SMT_NUM_SUBMATRIX_MLP")
+    allocation = os.environ.get("SMT_BUDGET_ALLOCATION", "attention_only").lower()
+
+    if explicit_attn is not None or explicit_mlp is not None:
+        attn_blocks = explicit_attn if explicit_attn is not None else max(0, requested_total - (explicit_mlp or 0))
+        mlp_blocks = explicit_mlp if explicit_mlp is not None else max(0, requested_total - attn_blocks)
+    elif allocation in {"attention_only", "attn_only", "official_peft"}:
+        attn_blocks, mlp_blocks = requested_total, 0
+    elif allocation == "mlp_only":
+        attn_blocks, mlp_blocks = 0, requested_total
+    elif allocation == "equal":
+        attn_blocks = requested_total // 2
+        mlp_blocks = requested_total - attn_blocks
+    elif allocation == "capacity":
+        total_available = max(1, available_attn + available_mlp)
+        attn_blocks = round(requested_total * available_attn / total_available)
+        mlp_blocks = requested_total - attn_blocks
+    else:
+        logger.warning("[SMT] Unknown SMT_BUDGET_ALLOCATION=%s; using attention_only", allocation)
+        attn_blocks, mlp_blocks = requested_total, 0
+
+    attn_blocks = min(max(0, attn_blocks), available_attn)
+    mlp_blocks = min(max(0, mlp_blocks), available_mlp)
+    selected_total = attn_blocks + mlp_blocks
+    logger.info(
+        "[SMT] requested_blocks=%s, attn_blocks=%s/%s, mlp_blocks=%s/%s, "
+        "trainable_params=%s, allocation=%s",
+        requested_total,
+        attn_blocks,
+        available_attn,
+        mlp_blocks,
+        available_mlp,
+        selected_total * params_per_block,
+        allocation,
+    )
+    return attn_blocks, mlp_blocks
 
 
 def compute_total_target_blocks(layers, target_params=170_000_000):
@@ -126,29 +266,32 @@ def _move_batch_to_device(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-def accumulate_gradient_block_scores(
+def accumulate_gradient_tensors(
     model,
     layers,
     train_dataset,
     calibration_steps=100,
     calibration_batch_size=1,
 ):
-    """Score each candidate block by mean absolute gradient over calibration batches."""
+    """Accumulate raw dense gradients like the official SMT warmup trainer."""
     device = next(model.parameters()).device
-    scores = {}
+    grads = {}
     for name, module in layers.items():
         row_blocks = module.out_features // BLOCK_DIM
         col_blocks = module.in_features // BLOCK_DIM
         if row_blocks > 0 and col_blocks > 0:
-            scores[name] = torch.zeros((row_blocks, col_blocks), dtype=torch.float32)
+            grads[name] = torch.zeros(
+                (row_blocks * BLOCK_DIM, col_blocks * BLOCK_DIM),
+                dtype=torch.float32,
+            )
 
-    if not scores:
-        return scores, 0
+    if not grads:
+        return grads, 0
 
     for param in model.parameters():
         param.requires_grad = False
         param.grad = None
-    for name in scores:
+    for name in grads:
         layers[name].weight.requires_grad = True
 
     if hasattr(model.config, "use_cache"):
@@ -173,20 +316,13 @@ def accumulate_gradient_block_scores(
 
         for name, module in layers.items():
             grad = module.weight.grad
-            if grad is None or name not in scores:
+            if grad is None or name not in grads:
                 continue
 
-            row_blocks, col_blocks = scores[name].shape
+            row_blocks = module.out_features // BLOCK_DIM
+            col_blocks = module.in_features // BLOCK_DIM
             trimmed = grad[: row_blocks * BLOCK_DIM, : col_blocks * BLOCK_DIM]
-            block_scores = (
-                trimmed.detach()
-                .abs()
-                .reshape(row_blocks, BLOCK_DIM, col_blocks, BLOCK_DIM)
-                .mean(dim=(1, 3))
-                .float()
-                .cpu()
-            )
-            scores[name].add_(block_scores)
+            grads[name].add_(trimmed.detach().float().cpu())
             module.weight.grad = None
 
         completed_steps = step
@@ -194,18 +330,51 @@ def accumulate_gradient_block_scores(
             logger.info(f"[SMT] calibration_progress={step}/{calibration_steps}")
 
     model.zero_grad(set_to_none=True)
-    for name in scores:
+    for name in grads:
         layers[name].weight.requires_grad = False
 
-    return scores, completed_steps
+    return grads, completed_steps
 
 
-def select_top_gradient_blocks(scores, total_blocks):
-    """Select global top-k blocks across all target layers."""
+def _block_scores_from_grads(grads, calculation_strategy):
+    scores = {}
+    for name, grad in grads.items():
+        row_blocks = grad.shape[0] // BLOCK_DIM
+        col_blocks = grad.shape[1] // BLOCK_DIM
+        block_grad = grad.reshape(row_blocks, BLOCK_DIM, col_blocks, BLOCK_DIM)
+        if calculation_strategy == "mean_abs":
+            score = block_grad.mean(dim=(1, 3)).abs()
+        elif calculation_strategy in {"abs_mean", "absmean"}:
+            score = block_grad.abs().mean(dim=(1, 3))
+        elif calculation_strategy == "L1":
+            score = block_grad.abs().sum(dim=(1, 3))
+        elif calculation_strategy == "L2":
+            score = torch.sqrt((block_grad.abs() ** 2).sum(dim=(1, 3)))
+        else:
+            raise ValueError(f"Unsupported SMT calculation_strategy={calculation_strategy}")
+        scores[name] = score
+    return scores
+
+
+def select_top_gradient_blocks(scores, total_blocks, selection_strategy="no_restriction"):
+    """Select SMT blocks using the official no_restriction/norm_dist semantics."""
+    if total_blocks <= 0:
+        return {}
+    if selection_strategy == "norm_dist":
+        selected = {}
+        for name, score in scores.items():
+            flat_scores = score.reshape(-1)
+            k = min(total_blocks, flat_scores.numel())
+            values, indices = torch.topk(flat_scores, k=k)
+            selected[name] = [
+                (int(idx // score.shape[1]), int(idx % score.shape[1]))
+                for idx in indices.tolist()
+            ]
+        return selected
+
     heap = []
     for name, score in scores.items():
         flat_scores = score.reshape(-1)
-        col_blocks = score.shape[1]
         k = min(total_blocks, flat_scores.numel())
         if k <= 0:
             continue
@@ -266,11 +435,16 @@ def train_smt(
     **kwargs,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    target_modules = [
-        item.strip()
-        for item in os.environ.get("SMT_TARGET_MODULES", "q_proj,k_proj,v_proj,o_proj").split(",")
-        if item.strip()
-    ]
+    legacy_target_modules = os.environ.get("SMT_TARGET_MODULES")
+    if legacy_target_modules:
+        legacy_modules = [item.strip() for item in legacy_target_modules.split(",") if item.strip()]
+        attention_modules = [m for m in legacy_modules if m in {"q_proj", "k_proj", "v_proj", "o_proj"}]
+        mlp_modules = [m for m in legacy_modules if m in {"gate_proj", "up_proj", "down_proj"}]
+    else:
+        attention_modules = _parse_csv_env("SMT_ATTENTION_TARGET_MODULES", "q_proj,k_proj,v_proj")
+        mlp_modules = _parse_csv_env("SMT_MLP_TARGET_MODULES", "gate_proj,up_proj,down_proj")
+    selection_strategy = os.environ.get("SMT_SELECTION_STRATEGY", "no_restriction")
+    calculation_strategy = os.environ.get("SMT_CALCULATION_STRATEGY", "mean_abs")
     if smt_calibration_steps is None:
         smt_calibration_steps = int(os.environ.get("SMT_CALIBRATION_STEPS", "100"))
     if smt_calibration_batch_size is None:
@@ -295,15 +469,18 @@ def train_smt(
     if torch.cuda.is_available():
         model.to(torch.device("cuda"))
 
-    target_layers = find_target_linear_layers(model, target_modules)
-    total_selected_blocks = compute_total_target_blocks(target_layers, target_params)
+    attention_layers, mlp_layers = split_smt_candidate_layers(model, attention_modules, mlp_modules)
+    attn_blocks, mlp_blocks = compute_smt_block_budgets(attention_layers, mlp_layers, target_params)
+    target_layers = {**attention_layers, **mlp_layers}
 
     calibration_start = time.time()
     logger.info(
         f"[SMT] Starting gradient calibration: steps={smt_calibration_steps}, "
-        f"batch_size={smt_calibration_batch_size}, target_modules={target_modules}"
+        f"batch_size={smt_calibration_batch_size}, attention_modules={attention_modules}, "
+        f"mlp_modules={mlp_modules}, selection_strategy={selection_strategy}, "
+        f"calculation_strategy={calculation_strategy}"
     )
-    gradient_scores, completed_calibration_steps = accumulate_gradient_block_scores(
+    gradient_tensors, completed_calibration_steps = accumulate_gradient_tensors(
         model=model,
         layers=target_layers,
         train_dataset=train_dataset,
@@ -315,7 +492,14 @@ def train_smt(
         f"[SMT] calibration_seconds={calibration_seconds:.2f}, "
         f"completed_steps={completed_calibration_steps}"
     )
-    selected_blocks = select_top_gradient_blocks(gradient_scores, total_selected_blocks)
+    attention_grads = {name: gradient_tensors[name] for name in attention_layers if name in gradient_tensors}
+    mlp_grads = {name: gradient_tensors[name] for name in mlp_layers if name in gradient_tensors}
+    attention_scores = _block_scores_from_grads(attention_grads, calculation_strategy)
+    mlp_scores = _block_scores_from_grads(mlp_grads, calculation_strategy)
+    selected_blocks = {}
+    selected_blocks.update(select_top_gradient_blocks(attention_scores, attn_blocks, selection_strategy))
+    selected_blocks.update(select_top_gradient_blocks(mlp_scores, mlp_blocks, selection_strategy))
+    del gradient_tensors, attention_grads, mlp_grads, attention_scores, mlp_scores
 
     for param in model.parameters():
         param.requires_grad = False
@@ -334,9 +518,16 @@ def train_smt(
     with open(os.path.join(output_dir, "smt_selection_meta.json"), "w") as f:
         json.dump(
             {
-                "target_modules": target_modules,
+                "attention_modules": attention_modules,
+                "mlp_modules": mlp_modules,
+                "legacy_target_modules": legacy_target_modules,
                 "target_params": target_params,
                 "block_dim": BLOCK_DIM,
+                "selection_strategy": selection_strategy,
+                "calculation_strategy": calculation_strategy,
+                "smt_budget_allocation": os.environ.get("SMT_BUDGET_ALLOCATION", "attention_only"),
+                "num_submatrix_attn": attn_blocks,
+                "num_submatrix_mlp": mlp_blocks,
                 "requested_calibration_steps": smt_calibration_steps,
                 "completed_calibration_steps": completed_calibration_steps,
                 "calibration_batch_size": smt_calibration_batch_size,
@@ -363,7 +554,7 @@ def train_smt(
         logging_steps=5,
         report_to=report_to,
         seed=seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=_dataloader_num_workers(),
         remove_unused_columns=False,
         deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
@@ -375,7 +566,8 @@ def train_smt(
         tokenizer=tokenizer,
     )
 
-    last_checkpoint = get_last_checkpoint(output_dir)
+    resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}
+    last_checkpoint = get_last_checkpoint(output_dir) if resume_training else None
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     if os.environ.get("RAPA_SKIP_SAVE", "false").lower() in {"1", "true", "yes"}:
