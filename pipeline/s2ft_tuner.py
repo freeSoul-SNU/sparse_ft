@@ -150,6 +150,17 @@ def _projection_set():
     return set(projections)
 
 
+def _num_key_value_heads(model):
+    return int(
+        getattr(
+            model.config,
+            "num_key_value_heads",
+            getattr(model.config, "num_attention_heads", 0),
+        )
+        or 0
+    )
+
+
 def _resolve_ratios(model, target_params, v_ratio, o_ratio, u_ratio, d_ratio):
     explicit = {
         "v": _ratio_or_env(v_ratio, "S2FT_V_RATIO"),
@@ -163,10 +174,11 @@ def _resolve_ratios(model, target_params, v_ratio, o_ratio, u_ratio, d_ratio):
     num_layers = len(_get_layers(model))
     hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    num_kv_heads = _num_key_value_heads(model)
     intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
     head_dim = hidden_size // num_heads if num_heads else 0
     per_full_ratio = {
-        "v": num_layers * num_heads * hidden_size * head_dim,
+        "v": num_layers * num_kv_heads * hidden_size * head_dim,
         "o": num_layers * num_heads * hidden_size * head_dim,
         "u": num_layers * intermediate_size * hidden_size,
         "d": num_layers * intermediate_size * hidden_size,
@@ -251,6 +263,7 @@ def _choose_units_uniform(scores, num_layers, units_per_layer, ratio, method, rn
 def _collect_s2ft_activation_scores(
     model,
     train_dataset,
+    ratios,
     calibration_steps,
     calibration_batch_size,
     data_collator=None,
@@ -259,8 +272,10 @@ def _collect_s2ft_activation_scores(
     scores = {"v": {}, "o": {}, "u": {}, "d": {}}
     hooks = []
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    num_kv_heads = _num_key_value_heads(model)
     hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
     head_dim = hidden_size // num_heads if num_heads else 0
+    active = {name for name, ratio in ratios.items() if ratio > 0.0}
 
     def add_hook(name, module):
         layer = _layer_id(name)
@@ -269,8 +284,8 @@ def _collect_s2ft_activation_scores(
 
         def hook(_, inputs, output):
             with torch.no_grad():
-                if name.endswith("v_proj") and num_heads and head_dim:
-                    out = output.detach().float().abs().reshape(-1, num_heads, head_dim)
+                if name.endswith("v_proj") and num_kv_heads and head_dim:
+                    out = output.detach().float().abs().reshape(-1, num_kv_heads, head_dim)
                     scores["v"][layer] = out.mean(dim=(0, 2)).cpu()
                 elif name.endswith("o_proj") and num_heads and head_dim:
                     inp = inputs[0].detach().float().abs().reshape(-1, num_heads, head_dim)
@@ -285,7 +300,11 @@ def _collect_s2ft_activation_scores(
         hooks.append(module.register_forward_hook(hook))
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and name.endswith(("v_proj", "o_proj", "up_proj", "down_proj")):
+        if not isinstance(module, nn.Linear):
+            continue
+        short = name.rsplit(".", 1)[-1]
+        key = {"v_proj": "v", "o_proj": "o", "up_proj": "u", "down_proj": "d"}.get(short)
+        if key in active:
             add_hook(name, module)
 
     if hasattr(model.config, "use_cache"):
@@ -326,6 +345,7 @@ def _select_units(
     layers = _get_layers(model)
     num_layers = len(layers)
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    num_kv_heads = _num_key_value_heads(model)
     intermediate_size = int(getattr(model.config, "intermediate_size", 0) or 0)
     allocation = os.environ.get("S2FT_LAYER_ALLOCATION", "uniform").lower()
     rng = random.Random(seed)
@@ -334,20 +354,21 @@ def _select_units(
         scores, completed_steps = _collect_s2ft_activation_scores(
             model=model,
             train_dataset=train_dataset,
+            ratios=ratios,
             calibration_steps=calibration_steps,
             calibration_batch_size=calibration_batch_size,
             data_collator=data_collator,
         )
         if allocation == "uniform":
             selected = {
-                "v": _choose_units_uniform(scores["v"], num_layers, num_heads, ratios["v"], method, rng),
+                "v": _choose_units_uniform(scores["v"], num_layers, num_kv_heads, ratios["v"], method, rng),
                 "o": _choose_units_uniform(scores["o"], num_layers, num_heads, ratios["o"], method, rng),
                 "u": _choose_units_uniform(scores["u"], num_layers, intermediate_size, ratios["u"], method, rng),
                 "d": _choose_units_uniform(scores["d"], num_layers, intermediate_size, ratios["d"], method, rng),
             }
         else:
             selected = {
-                "v": _choose_units(scores["v"], _count_selected(num_layers * num_heads, ratios["v"]), method),
+                "v": _choose_units(scores["v"], _count_selected(num_layers * num_kv_heads, ratios["v"]), method),
                 "o": _choose_units(scores["o"], _count_selected(num_layers * num_heads, ratios["o"]), method),
                 "u": _choose_units(scores["u"], _count_selected(num_layers * intermediate_size, ratios["u"]), method),
                 "d": _choose_units(scores["d"], _count_selected(num_layers * intermediate_size, ratios["d"]), method),
@@ -355,7 +376,7 @@ def _select_units(
         return selected, completed_steps
 
     selected = {
-        "v": _select_random_units(num_layers, num_heads, ratios["v"], rng, allocation),
+        "v": _select_random_units(num_layers, num_kv_heads, ratios["v"], rng, allocation),
         "o": _select_random_units(num_layers, num_heads, ratios["o"], rng, allocation),
         "u": _select_random_units(num_layers, intermediate_size, ratios["u"], rng, allocation),
         "d": _select_random_units(num_layers, intermediate_size, ratios["d"], rng, allocation),
@@ -418,10 +439,18 @@ def _reorder_columns_by_units(linear, order, unit_size=1):
 
 def _convert_mha_layer_to_s2(model, selected):
     head_dim = model.config.hidden_size // model.config.num_attention_heads
+    num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
+    num_kv_heads = _num_key_value_heads(model)
     replacements = 0
     for layer_idx, layer in enumerate(_get_layers(model)):
         selected_v = set(selected["v"].get(layer_idx, []))
         selected_o = set(selected["o"].get(layer_idx, []))
+        if num_kv_heads != num_heads and (selected_v or selected_o):
+            raise ValueError(
+                "[S2FT] Attention projection tuning is not supported for GQA/MQA models "
+                f"(num_attention_heads={num_heads}, num_key_value_heads={num_kv_heads}). "
+                "For Mistral MT-Bench, keep S2FT_TARGET_PROJECTIONS=d."
+            )
         only_v = sorted(selected_v - selected_o)
         only_o = sorted(selected_o - selected_v)
         vo = sorted(selected_v & selected_o)
@@ -514,7 +543,7 @@ def _restore_s2_linear_modules(model):
 def train_s2ft(
     model_name_or_path, dataset_path, output_dir, num_train_epochs=1, max_steps=-1,
     per_device_train_batch_size=1, gradient_accumulation_steps=1, learning_rate=5e-5,
-    lr_scheduler_type="linear", max_seq_length=512, target_params=170_000_000,
+    lr_scheduler_type="linear", warmup_steps=0, max_seq_length=512, target_params=170_000_000,
     bf16=True, hf_token=None, seed=42, report_to="none",
     s2ft_calibration_steps=None, s2ft_calibration_batch_size=None,
     s2ft_v_ratio=None, s2ft_o_ratio=None, s2ft_u_ratio=None, s2ft_d_ratio=None,
@@ -605,6 +634,7 @@ def train_s2ft(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         lr_scheduler_type=lr_scheduler_type,
+        warmup_steps=warmup_steps,
         bf16=bf16,
         save_strategy="no" if 0 < max_steps < 100 else "epoch",
         logging_steps=5,

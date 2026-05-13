@@ -29,14 +29,18 @@ export RESULTS_FILE="${RESULTS_FILE:-${RESULT_ROOT}/results.md}"
 export METRICS_FILE="${METRICS_FILE:-${RESULT_ROOT}/metrics.tsv}"
 
 # Methods to run. Override to test a subset, e.g. METHODS="sift smt".
-# export METHODS="${METHODS:-sift spiel smt s2ft ltsft}"
-export METHODS="${METHODS:-s2ft}"
+export METHODS="${METHODS:-sift spiel smt s2ft ltsft}"
 
 # GPU selection:
 # Prefer CUDA_VISIBLE_DEVICES from the command line.
 # If it is not set, this uses physical GPU_INDEX.
-# export GPU_INDEX="${GPU_INDEX:-0}"
-export GPU_INDEX="${GPU_INDEX:-1}"
+if [ -z "${GPU_INDEX+x}" ]; then
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        export GPU_INDEX="${CUDA_VISIBLE_DEVICES%%,*}"
+    else
+        export GPU_INDEX=0
+    fi
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_INDEX}}"
 
 # Fine-tuning scale
@@ -59,7 +63,8 @@ export MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-76000}"
 # path by default.  SIFT defaults to the paper-like hook implementation below,
 # which optimizes only sparse parameters on a single GPU and does not use
 # DeepSpeed/offload unless SIFT_HOOK_USE_DEEPSPEED=true is explicitly set.
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-smt ltsft spiel s2ft}"
+# export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-smt ltsft spiel s2ft}"
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-}"
 
 # Actual fine-tuning script defaults to train+eval.
 # Set RUN_EVAL=false if you only want fine-tuning.

@@ -36,6 +36,7 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
+    p.add_argument("--warmup_steps", type=int, default=0)
     p.add_argument("--max_seq_length", type=int, default=512)
     p.add_argument("--target_params", type=int, default=170_000_000,
                    help="Target number of trainable parameters (~170M)")
@@ -117,6 +118,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         max_seq_length=args.max_seq_length,
         target_params=args.target_params,
         bf16=args.bf16,
