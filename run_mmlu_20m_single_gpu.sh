@@ -40,9 +40,10 @@ LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 RESET_RESULTS="${RESET_RESULTS:-false}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-5}"
 GPU_MONITOR_LOG_INTERVAL="${GPU_MONITOR_LOG_INTERVAL:-60}"
+MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-0}"
 SYNC_LMFLOW="${SYNC_LMFLOW:-auto}"
 RESUME_TRAINING="${RESUME_TRAINING:-false}"
-CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-}"
+CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-}"
 BASE_DS_CONFIG="${BASE_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
 OFFLOAD_DS_CONFIG="${OFFLOAD_DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero2_offload.json}"
 SIFT_USE_GRADIENT_CALIBRATION="${SIFT_USE_GRADIENT_CALIBRATION:-true}"
@@ -50,6 +51,14 @@ SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
 SIFT_HOOK_ZERO_DENSE_GRAD="${SIFT_HOOK_ZERO_DENSE_GRAD:-true}"
 SIFT_HOOK_STRIP_DS_OPTIMIZER="${SIFT_HOOK_STRIP_DS_OPTIMIZER:-true}"
 SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
+SPIEL_DELTA_DTYPE="${SPIEL_DELTA_DTYPE:-float32}"
+SPIEL_SELECTION_ALGORITHM="${SPIEL_SELECTION_ALGORITHM:-rigl}"
+SPIEL_RESELECTION_STEPS="${SPIEL_RESELECTION_STEPS:-20}"
+SPIEL_SELECTION_ACCUMULATION_STEPS="${SPIEL_SELECTION_ACCUMULATION_STEPS:-5}"
+SPIEL_RESELECTION_RATE_POLICY="${SPIEL_RESELECTION_RATE_POLICY:-linear}"
+SPIEL_INITIAL_RESELECTION_RATE="${SPIEL_INITIAL_RESELECTION_RATE:-0.2}"
+SPIEL_TARGET_MODULES="${SPIEL_TARGET_MODULES:-q_proj,o_proj,v_proj,k_proj,gate_proj,up_proj,down_proj}"
+SPIEL_STRIP_DS_OPTIMIZER="${SPIEL_STRIP_DS_OPTIMIZER:-true}"
 SIFT_CALIBRATION_ONLY="${SIFT_CALIBRATION_ONLY:-false}"
 SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
 SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"
@@ -62,12 +71,17 @@ S2FT_LAYER_ALLOCATION="${S2FT_LAYER_ALLOCATION:-uniform}"
 LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
+RAPA_DATALOADER_PIN_MEMORY="${RAPA_DATALOADER_PIN_MEMORY:-true}"
+RAPA_USE_DYNAMIC_PADDING="${RAPA_USE_DYNAMIC_PADDING:-true}"
 export SIFT_CALIBRATION_STEPS SIFT_CALIBRATION_BATCH_SIZE
 export RESUME_TRAINING SIFT_USE_GRADIENT_CALIBRATION SIFT_CALIBRATION_ONLY
 export SIFT_IMPLEMENTATION SIFT_HOOK_ZERO_DENSE_GRAD SIFT_HOOK_STRIP_DS_OPTIMIZER SIFT_HOOK_USE_DEEPSPEED
+export SPIEL_DELTA_DTYPE SPIEL_SELECTION_ALGORITHM SPIEL_RESELECTION_STEPS SPIEL_SELECTION_ACCUMULATION_STEPS
+export SPIEL_RESELECTION_RATE_POLICY SPIEL_INITIAL_RESELECTION_RATE SPIEL_TARGET_MODULES SPIEL_STRIP_DS_OPTIMIZER
 export SMT_CALIBRATION_STEPS SMT_CALIBRATION_BATCH_SIZE
 export S2FT_CALIBRATION_STEPS S2FT_CALIBRATION_BATCH_SIZE
-export S2FT_RATIO_PRESET S2FT_LAYER_ALLOCATION RAPA_DATALOADER_NUM_WORKERS
+export S2FT_RATIO_PRESET S2FT_LAYER_ALLOCATION RAPA_DATALOADER_NUM_WORKERS RAPA_DATALOADER_PIN_MEMORY
+export RAPA_USE_DYNAMIC_PADDING
 export LTSFT_MASK_SEARCH_STEPS LTSFT_N_FT_ITERATIONS
 
 if [ ! -f "${DATASET}" ]; then
@@ -201,6 +215,33 @@ gpu_used_mb() {
         | awk 'NR == 1 { gsub(/ /, ""); print int($1); found=1 } END { if (!found) print 0 }'
 }
 
+gpu_total_mb() {
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "${NVIDIA_SMI_GPU_ID}" 2>/dev/null \
+        | awk 'NR == 1 { gsub(/ /, ""); print int($1); found=1 } END { if (!found) print 0 }'
+}
+
+ensure_gpu_has_free_memory() {
+    local method="$1"
+    local total used free
+
+    if [ "${MIN_FREE_GPU_MB}" -le 0 ]; then
+        return 0
+    fi
+
+    total="$(gpu_total_mb)"
+    used="$(gpu_used_mb)"
+    free=$((total - used))
+    if [ "${free}" -lt 0 ]; then
+        free=0
+    fi
+
+    if [ "${free}" -lt "${MIN_FREE_GPU_MB}" ]; then
+        echo "[mmlu] ${method} not started: GPU ${NVIDIA_SMI_GPU_ID} free_memory_mb=${free} below MIN_FREE_GPU_MB=${MIN_FREE_GPU_MB} (used=${used}, total=${total})." >&2
+        echo "[mmlu] Choose an idle GPU or lower MIN_FREE_GPU_MB if this is intentional." >&2
+        return 1
+    fi
+}
+
 descendant_pids() {
     local root_pid="$1"
     local pending="${root_pid}"
@@ -313,7 +354,7 @@ start_gpu_monitor() {
         cpu_rss_max_peak=0
         system_delta_peak=0
         last_log=0
-        while [ ! -f "${stop_file}" ]; do
+        while [ ! -f "${stop_file}" ] && kill -0 "${root_pid}" >/dev/null 2>&1; do
             mem="$(gpu_used_mb)"
             read -r cpu_rss_sum cpu_rss_max cpu_pss < <(cpu_stats_mb "${root_pid}" "${marker}")
             system_delta=$(( $(system_used_mem_mb) - baseline_system_used ))
@@ -422,6 +463,12 @@ for method in ${METHODS}; do
 
     train_ec=0
     if [ "${RUN_TRAIN}" = "true" ]; then
+        ensure_gpu_has_free_memory "${method}" || {
+            echo "| ${method} | train_failed:insufficient_gpu_memory | | |" >> "${RESULTS_FILE}"
+            echo -e "${method}\ttrain\t0\t$(gpu_used_mb)\t0\t0\t0\t0\t${BATCH_SIZE}\t${GRAD_ACCUM}\t1" >> "${METRICS_FILE}"
+            continue
+        }
+
         echo "============================================"
         echo "[mmlu] Training ${method} on GPU ${GPU_INDEX} batch=${BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
         echo "============================================"

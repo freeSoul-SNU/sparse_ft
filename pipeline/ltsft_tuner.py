@@ -15,7 +15,6 @@ import threading
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset as TorchDataset
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -29,6 +28,14 @@ except ImportError:
         from .sift_tuner import SparseLinear, restore_linear_modules
     except ImportError:
         from sift_tuner import SparseLinear, restore_linear_modules
+
+try:
+    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+except ImportError:
+    try:
+        from .data_utils import build_lmflow_text_dataset
+    except ImportError:
+        from data_utils import build_lmflow_text_dataset
 
 
 def _read_self_rss_mb():
@@ -92,18 +99,6 @@ def _deepspeed_config(default_path):
 
 def _dataloader_num_workers():
     return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
-
-
-class TextDataset(TorchDataset):
-    def __init__(self, instances, tokenizer, max_len):
-        self.data = []
-        for item in instances:
-            text = item.get("text", "")
-            enc = tokenizer(text, truncation=True, max_length=max_len, padding="max_length", return_tensors="pt")
-            ids = enc["input_ids"].squeeze()
-            self.data.append({"input_ids": ids, "labels": ids.clone()})
-    def __len__(self): return len(self.data)
-    def __getitem__(self, i): return self.data[i]
 
 
 class SparseGradientMaskTrainer(Trainer):
@@ -332,9 +327,15 @@ def train_ltsft(
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16 if bf16 else torch.float32, **tok_kwargs)
 
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    train_dataset, data_collator, dynamic_padding = build_lmflow_text_dataset(
+        dataset_path, tokenizer, max_seq_length
+    )
+    logger.info(
+        "[LT-SFT] data_processing=lmflow_text, samples=%s, dynamic_padding=%s, "
+        "label_pad_token_id=-100, attention_mask=true",
+        len(train_dataset),
+        dynamic_padding,
+    )
 
     selection_start = time.time()
     maskable_names = _target_linear_weight_names(model, target_modules)
@@ -390,7 +391,13 @@ def train_ltsft(
             deepspeed=ds_config,
         )
         logger.info("[LT-SFT] Starting dense lottery-ticket mask search")
-        search_trainer = Trainer(model=model, args=search_args, train_dataset=train_dataset, tokenizer=tokenizer)
+        search_trainer = Trainer(
+            model=model,
+            args=search_args,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
         search_trainer.train()
         del search_trainer
         gc.collect()
@@ -450,6 +457,7 @@ def train_ltsft(
             args=training_args,
             train_dataset=train_dataset,
             tokenizer=tokenizer,
+            data_collator=data_collator,
         )
         resume_checkpoint = get_last_checkpoint(output_dir) if iteration == 0 else None
         if torch.cuda.is_available():

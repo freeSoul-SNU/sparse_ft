@@ -19,7 +19,7 @@ import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader
 from transformers import Trainer, TrainerCallback, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -35,6 +35,14 @@ if SIFT_PATH not in sys.path:
     sys.path.insert(0, SIFT_PATH)
 
 from sift import HookSIFT, SIFT  # noqa: E402
+
+try:
+    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+except ImportError:
+    try:
+        from .data_utils import build_lmflow_text_dataset
+    except ImportError:
+        from data_utils import build_lmflow_text_dataset
 
 
 def _deepspeed_config(default_path):
@@ -302,23 +310,6 @@ def replace_with_sparse_linear(model, sift_obj, target_modules):
     return model
 
 
-class TextDataset(TorchDataset):
-    def __init__(self, instances, tokenizer, max_len):
-        self.data = []
-        for item in instances:
-            text = item.get("text", "")
-            enc = tokenizer(text, truncation=True, max_length=max_len,
-                            padding="max_length", return_tensors="pt")
-            ids = enc["input_ids"].squeeze()
-            self.data.append({"input_ids": ids, "labels": ids.clone()})
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, i):
-        return self.data[i]
-
-
 def _move_batch_to_device(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
@@ -330,6 +321,7 @@ def select_sift_gradient_indices(
     sparse_modules,
     calibration_steps=1,
     calibration_batch_size=1,
+    data_collator=None,
 ):
     """Select SIFT coordinates using top-k accumulated absolute gradients."""
     device = next(model.parameters()).device
@@ -350,7 +342,13 @@ def select_sift_gradient_indices(
         model.config.use_cache = False
     model.train()
 
-    loader = DataLoader(train_dataset, batch_size=calibration_batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(
+        train_dataset,
+        batch_size=calibration_batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=data_collator,
+    )
     completed_steps = 0
     for step, batch in enumerate(loader, start=1):
         if step > calibration_steps:
@@ -426,9 +424,15 @@ def train_sift(
         **tok_kwargs,
     )
 
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    train_dataset, data_collator, dynamic_padding = build_lmflow_text_dataset(
+        dataset_path, tokenizer, max_seq_length
+    )
+    logger.info(
+        "[SIFT] data_processing=lmflow_text, samples=%s, dynamic_padding=%s, "
+        "label_pad_token_id=-100, attention_mask=true",
+        len(train_dataset),
+        dynamic_padding,
+    )
 
     selection_start = time.time()
     sparse_rate = compute_sparse_rate(model, target_params=target_params, sparse_modules=sparse_modules)
@@ -469,6 +473,7 @@ def train_sift(
                 sparse_modules=sparse_modules,
                 calibration_steps=calibration_steps,
                 calibration_batch_size=calibration_batch_size,
+                data_collator=data_collator,
             )
         finally:
             calibration_peak_cpu_rss = cpu_monitor.stop()
@@ -606,6 +611,7 @@ def train_sift(
             args=training_args,
             train_dataset=train_dataset,
             tokenizer=tokenizer,
+            data_collator=data_collator,
             sift_obj=sift_obj,
             callbacks=[SIFTHookMergeCallback(sift_obj)],
         )
@@ -615,6 +621,7 @@ def train_sift(
             args=training_args,
             train_dataset=train_dataset,
             tokenizer=tokenizer,
+            data_collator=data_collator,
         )
 
     resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}

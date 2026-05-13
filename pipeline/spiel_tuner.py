@@ -4,12 +4,12 @@ import os
 import sys
 import json
 import sysconfig
+import tempfile
 import time
 
 import torch
 from transformers import (
     Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM,
-    DataCollatorForSeq2Seq,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -20,7 +20,7 @@ PEFT_ROOT = os.environ.get("PEFT_DIR", os.path.join(RAPA_HOME, "peft"))
 PEFT_SFT_PATH = os.path.join(PEFT_ROOT, "src")
 SPARSE_FT_ROOT = os.environ.get(
     "SPARSE_FT_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..")),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 )
 SPIEL_ROOT = os.path.join(SPARSE_FT_ROOT, "methods", "spiel")
 SPIEL_SFT_PATH = os.path.join(SPIEL_ROOT, "peft_sft")
@@ -39,12 +39,56 @@ for mod_name in list(sys.modules.keys()):
     if mod_name == "peft" or mod_name.startswith("peft."):
         del sys.modules[mod_name]
 
+try:
+    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+except ImportError:
+    try:
+        from .data_utils import build_lmflow_text_dataset
+    except ImportError:
+        from data_utils import build_lmflow_text_dataset
+
 
 def _deepspeed_config(default_path):
     value = os.environ.get("DS_CONFIG", default_path)
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
+
+
+def _external_optimizer_deepspeed_config(default_path, output_dir):
+    value = _deepspeed_config(default_path)
+    if value is None:
+        return None
+    if os.environ.get("SPIEL_STRIP_DS_OPTIMIZER", "true").lower() not in {"1", "true", "yes"}:
+        return value
+    with open(value) as f:
+        config = json.load(f)
+    # SpIEL needs its custom SftAdamW/SftSM3 optimizer because reselection
+    # seeds optimizer state for newly grown sparse deltas.
+    config.pop("optimizer", None)
+    config.pop("scheduler", None)
+    config["zero_force_ds_cpu_optimizer"] = False
+    os.makedirs(output_dir, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="ds_spiel_external_optimizer_", suffix=".json", dir=output_dir)
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f, indent=4)
+    return path
+
+
+def _csv_env(name, default):
+    raw = os.environ.get(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _dataloader_num_workers():
+    return int(os.environ.get("RAPA_DATALOADER_NUM_WORKERS", "0"))
+
+
+def _env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def train_spiel(
@@ -95,12 +139,26 @@ def train_spiel(
     logger.info(f"[SpiEL] total_linear={total_linear:,}, density={density:.4f}")
 
     selection_start = time.time()
+    delta_dtype = os.environ.get("SPIEL_DELTA_DTYPE", "float32")
+    if delta_dtype not in {"auto", "bfloat16", "float16", "float32"}:
+        raise ValueError(f"Unsupported SPIEL_DELTA_DTYPE={delta_dtype}")
+    target_modules = _csv_env(
+        "SPIEL_TARGET_MODULES",
+        "q_proj,o_proj,v_proj,k_proj,gate_proj,up_proj,down_proj",
+    )
+    logger.info(
+        "[SpiEL] selection_algorithm=%s, delta_dtype=%s, target_modules=%s",
+        os.environ.get("SPIEL_SELECTION_ALGORITHM", "rigl"),
+        delta_dtype,
+        target_modules,
+    )
+
     peft_config = SftConfig(
         task_type=TaskType.CAUSAL_LM,
         density=density,
         num_tunable_weights=target_params,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        dtype="bfloat16" if bf16 else "float32",
+        target_modules=target_modules,
+        dtype=delta_dtype,
         selection_algorithm=os.environ.get("SPIEL_SELECTION_ALGORITHM", "rigl"),
         reselection_steps=int(os.environ.get("SPIEL_RESELECTION_STEPS", "20")),
         selection_accumulation_steps=int(os.environ.get("SPIEL_SELECTION_ACCUMULATION_STEPS", "5")),
@@ -111,26 +169,22 @@ def train_spiel(
     model.print_trainable_parameters()
     logger.info(f"[SpiEL] weight_selection_seconds={time.time() - selection_start:.2f}")
 
-    # Load dataset
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    instances = raw.get("instances", [])
-
-    from torch.utils.data import Dataset as TorchDataset
-
-    class TextDataset(TorchDataset):
-        def __init__(self, instances, tokenizer, max_len):
-            self.data = []
-            for item in instances:
-                text = item.get("text", "")
-                enc = tokenizer(text, truncation=True, max_length=max_len,
-                                padding="max_length", return_tensors="pt")
-                ids = enc["input_ids"].squeeze()
-                self.data.append({"input_ids": ids, "labels": ids.clone()})
-        def __len__(self): return len(self.data)
-        def __getitem__(self, i): return self.data[i]
-
-    train_dataset = TextDataset(instances, tokenizer, max_seq_length)
+    train_dataset, data_collator, dynamic_padding = build_lmflow_text_dataset(
+        dataset_path, tokenizer, max_seq_length
+    )
+    logger.info(
+        "[SpiEL] data_processing=lmflow_text, samples=%s, dynamic_padding=%s, "
+        "label_pad_token_id=-100, attention_mask=true",
+        len(train_dataset),
+        dynamic_padding,
+    )
+    dataloader_num_workers = _dataloader_num_workers()
+    dataloader_pin_memory = _env_bool("RAPA_DATALOADER_PIN_MEMORY", True)
+    logger.info(
+        "[SpiEL] dataloader_num_workers=%s, dataloader_pin_memory=%s",
+        dataloader_num_workers,
+        dataloader_pin_memory,
+    )
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -145,10 +199,14 @@ def train_spiel(
         logging_steps=5,
         report_to=report_to,
         seed=seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_pin_memory=dataloader_pin_memory,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
-        deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
+        deepspeed=_external_optimizer_deepspeed_config(
+            os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json"),
+            output_dir,
+        ),
     )
 
     SpiELTrainer = SftTrainer(Trainer)
@@ -157,10 +215,14 @@ def train_spiel(
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        data_collator=data_collator,
         sft_config=peft_config,
     )
 
-    last_checkpoint = get_last_checkpoint(output_dir)
+    if os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}:
+        last_checkpoint = get_last_checkpoint(output_dir)
+    else:
+        last_checkpoint = None
     trainer.train(resume_from_checkpoint=last_checkpoint)
 
     if os.environ.get("RAPA_SKIP_SAVE", "false").lower() in {"1", "true", "yes"}:

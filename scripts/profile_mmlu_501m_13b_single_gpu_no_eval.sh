@@ -58,7 +58,15 @@ esac
 # optimizer offload by default.
 export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
 export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
+export SPIEL_DELTA_DTYPE="${SPIEL_DELTA_DTYPE:-float32}"
+export SPIEL_SELECTION_ALGORITHM="${SPIEL_SELECTION_ALGORITHM:-rigl}"
+export SPIEL_RESELECTION_STEPS="${SPIEL_RESELECTION_STEPS:-20}"
+export SPIEL_SELECTION_ACCUMULATION_STEPS="${SPIEL_SELECTION_ACCUMULATION_STEPS:-5}"
+export SPIEL_RESELECTION_RATE_POLICY="${SPIEL_RESELECTION_RATE_POLICY:-linear}"
+export SPIEL_INITIAL_RESELECTION_RATE="${SPIEL_INITIAL_RESELECTION_RATE:-0.2}"
+export SPIEL_TARGET_MODULES="${SPIEL_TARGET_MODULES:-q_proj,o_proj,v_proj,k_proj,gate_proj,up_proj,down_proj}"
+export SPIEL_STRIP_DS_OPTIMIZER="${SPIEL_STRIP_DS_OPTIMIZER:-true}"
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-smt ltsft spiel s2ft}"
 export ENABLE_OFFLOAD_RETRY="${ENABLE_OFFLOAD_RETRY:-true}"
 
 # Match the official SMT PEFT example by default: q/k/v attention blocks,
@@ -85,4 +93,7 @@ export S2FT_U_RATIO="${S2FT_U_RATIO:-}"
 export S2FT_D_RATIO="${S2FT_D_RATIO:-}"
 
 # Call through bash so the base script does not need executable permission.
+export RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
+export RAPA_DATALOADER_PIN_MEMORY="${RAPA_DATALOADER_PIN_MEMORY:-false}"
+export RAPA_USE_DYNAMIC_PADDING="${RAPA_USE_DYNAMIC_PADDING:-true}"
 exec bash "${SPARSE_FT_ROOT}/scripts/profile_mmlu_20m_dual_gpu_no_eval.sh"

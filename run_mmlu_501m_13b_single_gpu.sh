@@ -49,13 +49,17 @@ export MAX_STEPS="${MAX_STEPS:-}"
 export BATCH_SIZE="${BATCH_SIZE:-4}"
 export GRAD_ACCUM="${GRAD_ACCUM:-2}"
 export LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+# SpiEL 13B/501M can peak near a full 80GB A100 during DeepSpeed setup.  Fail
+# fast if the requested GPU is already occupied instead of spending minutes in
+# sparse-weight initialization and then OOMing.
+export MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-76000}"
 
 # 13B + 501M trainable parameters can exceed a single A100's memory once
 # optimizer states are included.  Most methods use the CPU optimizer offload
 # path by default.  SIFT defaults to the paper-like hook implementation below,
 # which optimizes only sparse parameters on a single GPU and does not use
 # DeepSpeed/offload unless SIFT_HOOK_USE_DEEPSPEED=true is explicitly set.
-export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS:-smt ltsft spiel s2ft}"
+export CPU_OFFLOAD_METHODS="${CPU_OFFLOAD_METHODS-smt ltsft spiel s2ft}"
 
 # Actual fine-tuning script defaults to train+eval.
 # Set RUN_EVAL=false if you only want fine-tuning.
@@ -69,6 +73,14 @@ export SIFT_IMPLEMENTATION="${SIFT_IMPLEMENTATION:-hook}"
 export SIFT_HOOK_ZERO_DENSE_GRAD="${SIFT_HOOK_ZERO_DENSE_GRAD:-true}"
 export SIFT_HOOK_STRIP_DS_OPTIMIZER="${SIFT_HOOK_STRIP_DS_OPTIMIZER:-true}"
 export SIFT_HOOK_USE_DEEPSPEED="${SIFT_HOOK_USE_DEEPSPEED:-false}"
+export SPIEL_DELTA_DTYPE="${SPIEL_DELTA_DTYPE:-float32}"
+export SPIEL_SELECTION_ALGORITHM="${SPIEL_SELECTION_ALGORITHM:-rigl}"
+export SPIEL_RESELECTION_STEPS="${SPIEL_RESELECTION_STEPS:-20}"
+export SPIEL_SELECTION_ACCUMULATION_STEPS="${SPIEL_SELECTION_ACCUMULATION_STEPS:-5}"
+export SPIEL_RESELECTION_RATE_POLICY="${SPIEL_RESELECTION_RATE_POLICY:-linear}"
+export SPIEL_INITIAL_RESELECTION_RATE="${SPIEL_INITIAL_RESELECTION_RATE:-0.2}"
+export SPIEL_TARGET_MODULES="${SPIEL_TARGET_MODULES:-q_proj,o_proj,v_proj,k_proj,gate_proj,up_proj,down_proj}"
+export SPIEL_STRIP_DS_OPTIMIZER="${SPIEL_STRIP_DS_OPTIMIZER:-true}"
 export SIFT_CALIBRATION_ONLY="${SIFT_CALIBRATION_ONLY:-false}"
 export SIFT_CALIBRATION_STEPS="${SIFT_CALIBRATION_STEPS:-1}"
 export SIFT_CALIBRATION_BATCH_SIZE="${SIFT_CALIBRATION_BATCH_SIZE:-1}"
@@ -81,6 +93,8 @@ export S2FT_LAYER_ALLOCATION="${S2FT_LAYER_ALLOCATION:-uniform}"
 export LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 export LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 export RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
+export RAPA_DATALOADER_PIN_MEMORY="${RAPA_DATALOADER_PIN_MEMORY:-false}"
+export RAPA_USE_DYNAMIC_PADDING="${RAPA_USE_DYNAMIC_PADDING:-true}"
 
 # SMT official PEFT example uses q/k/v attention submatrices by default
 # (--num_submatrix_mlp 0, --target_modules q_proj/k_proj/v_proj).

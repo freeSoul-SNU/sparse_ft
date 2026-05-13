@@ -17,7 +17,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
 
 BLOCK_DIM = 256  # SMT block dimension
+
+try:
+    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+except ImportError:
+    try:
+        from .data_utils import build_lmflow_text_dataset
+    except ImportError:
+        from data_utils import build_lmflow_text_dataset
 
 
 def _deepspeed_config(default_path):
@@ -41,9 +49,11 @@ class BlockSparseLinear(nn.Module):
         super().__init__()
         self.in_features = orig_linear.in_features
         self.out_features = orig_linear.out_features
-        self.weight = nn.Parameter(orig_linear.weight.detach().clone(), requires_grad=False)
+        self.weight = orig_linear.weight
+        self.weight.requires_grad = False
         if orig_linear.bias is not None:
-            self.register_buffer("bias", orig_linear.bias.detach().clone())
+            self.bias = orig_linear.bias
+            self.bias.requires_grad = False
         else:
             self.bias = None
 
@@ -249,19 +259,6 @@ def compute_blocks_per_layer(model, target_params=170_000_000, target_modules=No
     return blocks_per_layer
 
 
-class TextDataset(TorchDataset):
-    def __init__(self, instances, tokenizer, max_len):
-        self.data = []
-        for item in instances:
-            text = item.get("text", "")
-            enc = tokenizer(text, truncation=True, max_length=max_len,
-                            padding="max_length", return_tensors="pt")
-            ids = enc["input_ids"].squeeze()
-            self.data.append({"input_ids": ids, "labels": ids.clone()})
-    def __len__(self): return len(self.data)
-    def __getitem__(self, i): return self.data[i]
-
-
 def _move_batch_to_device(batch, device):
     return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
@@ -272,6 +269,7 @@ def accumulate_gradient_tensors(
     train_dataset,
     calibration_steps=100,
     calibration_batch_size=1,
+    data_collator=None,
 ):
     """Accumulate raw dense gradients like the official SMT warmup trainer."""
     device = next(model.parameters()).device
@@ -303,6 +301,7 @@ def accumulate_gradient_tensors(
         batch_size=calibration_batch_size,
         shuffle=False,
         num_workers=0,
+        collate_fn=data_collator,
     )
 
     completed_steps = 0
@@ -461,9 +460,15 @@ def train_smt(
         **tok_kwargs,
     )
 
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    train_dataset, data_collator, dynamic_padding = build_lmflow_text_dataset(
+        dataset_path, tokenizer, max_seq_length
+    )
+    logger.info(
+        "[SMT] data_processing=lmflow_text, samples=%s, dynamic_padding=%s, "
+        "label_pad_token_id=-100, attention_mask=true",
+        len(train_dataset),
+        dynamic_padding,
+    )
 
     selection_start = time.time()
     if torch.cuda.is_available():
@@ -486,6 +491,7 @@ def train_smt(
         train_dataset=train_dataset,
         calibration_steps=smt_calibration_steps,
         calibration_batch_size=smt_calibration_batch_size,
+        data_collator=data_collator,
     )
     calibration_seconds = time.time() - calibration_start
     logger.info(
@@ -564,6 +570,7 @@ def train_smt(
         args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}

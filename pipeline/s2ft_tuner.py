@@ -6,7 +6,6 @@ The base weights are frozen and only each S2 layer's ``s2`` parameter is
 optimized.
 """
 import copy
-import json
 import logging
 import os
 import random
@@ -17,7 +16,7 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -34,6 +33,14 @@ try:
     from methods.s2ft import S2ColumnLinear, S2RowLinear
 except ImportError:
     from s2ft import S2ColumnLinear, S2RowLinear
+
+try:
+    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+except ImportError:
+    try:
+        from .data_utils import build_lmflow_text_dataset
+    except ImportError:
+        from data_utils import build_lmflow_text_dataset
 
 
 def _deepspeed_config(default_path):
@@ -97,22 +104,6 @@ class _PhaseMemoryMonitor:
         if self._thread is not None:
             self._thread.join()
         return self
-
-
-class TextDataset(TorchDataset):
-    def __init__(self, instances, tokenizer, max_len):
-        self.data = []
-        for item in instances:
-            text = item.get("text", "")
-            enc = tokenizer(text, truncation=True, max_length=max_len, padding="max_length", return_tensors="pt")
-            ids = enc["input_ids"].squeeze()
-            self.data.append({"input_ids": ids, "labels": ids.clone()})
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, i):
-        return self.data[i]
 
 
 def _move_batch_to_device(batch, device):
@@ -257,7 +248,13 @@ def _choose_units_uniform(scores, num_layers, units_per_layer, ratio, method, rn
     return selected
 
 
-def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, calibration_batch_size):
+def _collect_s2ft_activation_scores(
+    model,
+    train_dataset,
+    calibration_steps,
+    calibration_batch_size,
+    data_collator=None,
+):
     device = next(model.parameters()).device
     scores = {"v": {}, "o": {}, "u": {}, "d": {}}
     hooks = []
@@ -294,7 +291,13 @@ def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, cal
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
     model.eval()
-    loader = DataLoader(train_dataset, batch_size=calibration_batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(
+        train_dataset,
+        batch_size=calibration_batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=data_collator,
+    )
     completed_steps = 0
     with torch.no_grad():
         for step, batch in enumerate(loader, start=1):
@@ -310,7 +313,16 @@ def _collect_s2ft_activation_scores(model, train_dataset, calibration_steps, cal
     return scores, completed_steps
 
 
-def _select_units(model, train_dataset, ratios, method, calibration_steps, calibration_batch_size, seed):
+def _select_units(
+    model,
+    train_dataset,
+    ratios,
+    method,
+    calibration_steps,
+    calibration_batch_size,
+    seed,
+    data_collator=None,
+):
     layers = _get_layers(model)
     num_layers = len(layers)
     num_heads = int(getattr(model.config, "num_attention_heads", 0) or 0)
@@ -324,6 +336,7 @@ def _select_units(model, train_dataset, ratios, method, calibration_steps, calib
             train_dataset=train_dataset,
             calibration_steps=calibration_steps,
             calibration_batch_size=calibration_batch_size,
+            data_collator=data_collator,
         )
         if allocation == "uniform":
             selected = {
@@ -519,9 +532,15 @@ def train_s2ft(
         **tok_kwargs,
     )
 
-    with open(dataset_path) as f:
-        raw = json.load(f)
-    train_dataset = TextDataset(raw.get("instances", []), tokenizer, max_seq_length)
+    train_dataset, data_collator, dynamic_padding = build_lmflow_text_dataset(
+        dataset_path, tokenizer, max_seq_length
+    )
+    logger.info(
+        "[S2FT] data_processing=lmflow_text, samples=%s, dynamic_padding=%s, "
+        "label_pad_token_id=-100, attention_mask=true",
+        len(train_dataset),
+        dynamic_padding,
+    )
 
     selection_start = time.time()
     if s2ft_calibration_steps is None:
@@ -558,6 +577,7 @@ def train_s2ft(
         calibration_steps=s2ft_calibration_steps,
         calibration_batch_size=s2ft_calibration_batch_size,
         seed=seed,
+        data_collator=data_collator,
     )
     replacements = _convert_mha_layer_to_s2(model, selected)
     replacements += _convert_ffn_layer_to_s2(model, selected)
@@ -594,7 +614,13 @@ def train_s2ft(
         remove_unused_columns=False,
         deepspeed=_deepspeed_config(os.path.join(RAPA_HOME, "LMFlow", "configs", "rapa", "ds_zero1_sift.json")),
     )
-    trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, tokenizer=tokenizer)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+    )
     resume_training = os.environ.get("RESUME_TRAINING", "false").lower() in {"1", "true", "yes"}
     existing_checkpoint = get_last_checkpoint(output_dir)
     resume_checkpoint = existing_checkpoint if resume_training else None
