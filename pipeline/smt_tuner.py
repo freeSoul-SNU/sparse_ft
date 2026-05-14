@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import re
+import threading
 import time
 
 import torch
@@ -40,6 +41,58 @@ def _deepspeed_config(default_path):
     if value.lower() in {"", "0", "false", "none", "no"}:
         return None
     return value
+
+
+def _read_self_rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _read_self_pss_mb():
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+class _PhaseMemoryMonitor:
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.peak_rss_mb = 0
+        self.peak_pss_mb = 0
+        self._thread = None
+
+    def _sample(self):
+        self.peak_rss_mb = max(self.peak_rss_mb, _read_self_rss_mb())
+        self.peak_pss_mb = max(self.peak_pss_mb, _read_self_pss_mb())
+
+    def start(self):
+        self._sample()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def stop(self):
+        self._sample()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        return self
 
 
 class BlockSparseLinear(nn.Module):
@@ -479,6 +532,9 @@ def train_smt(
     attn_blocks, mlp_blocks = compute_smt_block_budgets(attention_layers, mlp_layers, target_params)
     target_layers = {**attention_layers, **mlp_layers}
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    calibration_monitor = _PhaseMemoryMonitor().start()
     calibration_start = time.time()
     logger.info(
         f"[SMT] Starting gradient calibration: steps={smt_calibration_steps}, "
@@ -494,11 +550,21 @@ def train_smt(
         calibration_batch_size=smt_calibration_batch_size,
         data_collator=data_collator,
     )
+    calibration_monitor.stop()
     calibration_seconds = time.time() - calibration_start
+    calibration_peak_allocated = 0
+    calibration_peak_reserved = 0
+    if torch.cuda.is_available():
+        calibration_peak_allocated = torch.cuda.max_memory_allocated() // (1024 * 1024)
+        calibration_peak_reserved = torch.cuda.max_memory_reserved() // (1024 * 1024)
     logger.info(
         f"[SMT] calibration_seconds={calibration_seconds:.2f}, "
         f"completed_steps={completed_calibration_steps}"
     )
+    logger.info(f"[SMT] calibration_peak_allocated_mb={calibration_peak_allocated}")
+    logger.info(f"[SMT] calibration_peak_reserved_mb={calibration_peak_reserved}")
+    logger.info(f"[SMT] calibration_peak_cpu_pss_mb={calibration_monitor.peak_pss_mb}")
+    logger.info(f"[SMT] calibration_peak_cpu_rss_mb={calibration_monitor.peak_rss_mb}")
     attention_grads = {name: gradient_tensors[name] for name in attention_layers if name in gradient_tensors}
     mlp_grads = {name: gradient_tensors[name] for name in mlp_layers if name in gradient_tensors}
     attention_scores = _block_scores_from_grads(attention_grads, calculation_strategy)
@@ -539,6 +605,10 @@ def train_smt(
                 "completed_calibration_steps": completed_calibration_steps,
                 "calibration_batch_size": smt_calibration_batch_size,
                 "calibration_seconds": calibration_seconds,
+                "calibration_peak_allocated_mb": calibration_peak_allocated,
+                "calibration_peak_reserved_mb": calibration_peak_reserved,
+                "calibration_peak_cpu_pss_mb": calibration_monitor.peak_pss_mb,
+                "calibration_peak_cpu_rss_mb": calibration_monitor.peak_rss_mb,
                 "selected_blocks": selected_block_count,
                 "selected_layers": len(selected_blocks),
                 "trainable_params": trainable,

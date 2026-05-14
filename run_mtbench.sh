@@ -27,18 +27,25 @@ TARGET_PARAMS="${TARGET_PARAMS:-170000000}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 EPOCHS="${EPOCHS:-1}"
 MAX_STEPS="${MAX_STEPS:-}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
 LEARNING_RATE="${LEARNING_RATE:-}"
-# LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-1e-3 5e-4}}"
-LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-1e-3}}"
+LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-5e-5}}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-linear}"
 WARMUP_STEPS="${WARMUP_STEPS:-61}"
 RUN_TRAIN="${RUN_TRAIN:-true}"
 RUN_EVAL="${RUN_EVAL:-true}"
 RESET_RESULTS="${RESET_RESULTS:-false}"
 SYNC_LMFLOW="${SYNC_LMFLOW:-auto}"
-JUDGE_MODEL="${JUDGE_MODEL:-gpt-4o-mini}"
+JUDGE_MODEL="${JUDGE_MODEL:-gpt-4o-mini-2024-07-18}"
+LLM_JUDGE_DIR="${LLM_JUDGE_DIR:-${LLM_ROOT}/FastChat_rebuttal/fastchat/llm_judge}"
+LLM_JUDGE_SCRIPT="${LLM_JUDGE_SCRIPT:-${LLM_JUDGE_DIR}/0_sparse_ft.sh}"
+LLM_JUDGE_GPU="${LLM_JUDGE_GPU:-${GPU_INDEX:-0}}"
+LLM_JUDGE_CONDA_ENV="${LLM_JUDGE_CONDA_ENV:-llmjudge_iclr2026}"
+EVAL_SUMMARY_FILE="${EVAL_SUMMARY_FILE:-${RESULT_ROOT}/mtbench_judge_summary.tsv}"
+RUN_REPORT_TSV="${RUN_REPORT_TSV:-${RESULT_ROOT}/run_report.tsv}"
+RUN_REPORT_MD="${RUN_REPORT_MD:-${RESULT_ROOT}/run_report.md}"
+RUN_TAG="${RUN_TAG:-}"
 
 SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
 SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
@@ -143,6 +150,10 @@ if [ ! -f "${DS_CONFIG}" ]; then
     echo "DeepSpeed config not found: ${DS_CONFIG}" >&2
     exit 1
 fi
+if [ "${RUN_EVAL}" = "true" ] && [ ! -x "${LLM_JUDGE_SCRIPT}" ]; then
+    echo "LLM judge script not found or not executable: ${LLM_JUDGE_SCRIPT}" >&2
+    exit 1
+fi
 
 if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS}" ]; then
     {
@@ -157,25 +168,71 @@ if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS}" ]; then
         echo "- gradient_accumulation_steps: ${GRAD_ACCUM}"
         echo "- max_seq_length: ${MAX_SEQ_LENGTH}"
         echo "- warmup_steps: ${WARMUP_STEPS}"
+        echo "- run_tag: ${RUN_TAG:-none}"
+        echo "- eval_script: ${LLM_JUDGE_SCRIPT}"
+        echo "- judge_model: ${JUDGE_MODEL}"
         echo "- smt_attention_target_modules: ${SMT_ATTENTION_TARGET_MODULES}"
+        echo "- smt_mlp_target_modules: ${SMT_MLP_TARGET_MODULES}"
         echo "- smt_budget_allocation: ${SMT_BUDGET_ALLOCATION}"
         echo "- s2ft_selection_method: ${S2FT_SELECTION_METHOD}"
         echo "- s2ft_target_projections: ${S2FT_TARGET_PROJECTIONS}"
+        echo "- data_format: ${RAPA_DATA_FORMAT}"
+        echo "- train_on_source: ${RAPA_TRAIN_ON_SOURCE}"
         echo ""
     } > "${RESULTS}"
 fi
 if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${METRICS_FILE}" ]; then
     echo -e "method\tlearning_rate\tphase\telapsed_seconds\tbatch_size\tgradient_accumulation_steps\tmax_seq_length\twarmup_steps\toutput_dir\texit_code" > "${METRICS_FILE}"
 fi
+if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RUN_REPORT_TSV}" ]; then
+    echo -e "run_id\tmethod\tlearning_rate\trun_tag\ttarget_params\tbatch_size\tgradient_accumulation_steps\tmax_seq_length\tlr_scheduler\twarmup_steps\tsmt_attention_target_modules\tsmt_mlp_target_modules\tsmt_budget_allocation\ts2ft_selection_method\ts2ft_target_projections\tdata_format\ttrain_on_source\ttrain_elapsed_seconds\ttrain_exit\teval_elapsed_seconds\teval_exit\tturn1\tturn2\tavg\tcheckpoint" > "${RUN_REPORT_TSV}"
+fi
+
+lr_label() {
+    local lr="$1"
+    lr="${lr//./p}"
+    lr="${lr//+/_}"
+    lr="${lr//-/_}"
+    printf '%s' "${lr}"
+}
+
+sanitize_tag() {
+    local value="$1"
+    value="${value// /_}"
+    value="${value//./p}"
+    value="${value//+/_}"
+    value="${value//-/_}"
+    value="${value//,/_}"
+    value="${value//:/_}"
+    printf '%s' "${value}"
+}
+
+write_markdown_report() {
+    {
+        echo "# MT-Bench Sparse-FT Run Report"
+        echo ""
+        echo "- result_root: ${RESULT_ROOT}"
+        echo "- judge_summary: ${EVAL_SUMMARY_FILE}"
+        echo "- generated_at: $(date --iso-8601=seconds)"
+        echo ""
+        echo "| run_id | method | lr | tag | batch | grad_accum | seq | train_exit | eval_exit | turn1 | turn2 | avg | checkpoint |"
+        echo "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        awk -F'\t' 'NR > 1 {
+            printf("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, ($4 == "" ? "-" : $4), $6, $7, $8, $19, $21, ($22 == "" ? "-" : $22), ($23 == "" ? "-" : $23), ($24 == "" ? "-" : $24), $25)
+        }' "${RUN_REPORT_TSV}"
+    } > "${RUN_REPORT_MD}"
+}
 
 cd "${LMFLOW_DIR}"
 
 for METHOD in ${METHODS}; do
     for LR in ${LEARNING_RATES}; do
-        LR_LABEL="${LR//./p}"
-        LR_LABEL="${LR_LABEL//+/_}"
-        LR_LABEL="${LR_LABEL//-/_}"
-        RUN_ID="mtbench_${METHOD}_lr${LR_LABEL}"
+        LR_LABEL="$(lr_label "${LR}")"
+        RUN_SUFFIX=""
+        if [ -n "${RUN_TAG}" ]; then
+            RUN_SUFFIX="_$(sanitize_tag "${RUN_TAG}")"
+        fi
+        RUN_ID="mtbench_${METHOD}_lr${LR_LABEL}${RUN_SUFFIX}"
         CKPT="${RESULT_ROOT}/checkpoints/${RUN_ID}"
         LOG="${RESULT_ROOT}/logs/${RUN_ID}"
         mkdir -p "${CKPT}" "${LOG}"
@@ -189,6 +246,7 @@ for METHOD in ${METHODS}; do
         fi
 
         TRAIN_EXIT=0
+        TRAIN_ELAPSED=""
         if [ "${RUN_TRAIN}" = "true" ]; then
             echo "========================================"
             echo "[MT-Bench] Training: method=${METHOD}, lr=${LR}"
@@ -235,22 +293,47 @@ for METHOD in ${METHODS}; do
         fi
         echo "[MT-Bench] ${METHOD}, lr=${LR} training DONE"
 
+        EVAL_EXIT=""
+        EVAL_ELAPSED=""
+        TURN1=""
+        TURN2=""
+        AVG=""
         if [ "${RUN_EVAL}" = "true" ]; then
-            echo "[MT-Bench] Evaluating: method=${METHOD}, lr=${LR}"
-            python "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/eval_mtbench.py" \
-                --model_path "${CKPT}" \
-                --method "${METHOD}" \
-                --results_file "${RESULTS}" \
-                --judge "${JUDGE_MODEL}" \
-                --openai_api_key "${OPENAI_API_KEY}" \
-                --num_gpus "${NUM_GPUS}" \
+            echo "[MT-Bench] Evaluating with FastChat llm_judge: method=${METHOD}, lr=${LR}, run_tag=${RUN_TAG:-none}"
+            EVAL_START="$(date +%s)"
+            set +e
+            RESULT_ROOT="${RESULT_ROOT}" \
+            CONDA_ENV="${LLM_JUDGE_CONDA_ENV}" \
+            JUDGE_MODEL="${JUDGE_MODEL}" \
+            EVAL_SUMMARY_FILE="${EVAL_SUMMARY_FILE}" \
+            RUN_TAG="${RUN_TAG}" \
+            SKIP_MISSING=false \
+            bash "${LLM_JUDGE_SCRIPT}" "${METHOD}" "${LLM_JUDGE_GPU}" "${LR}" "${RESULT_ROOT}" "${RUN_TAG}" \
                 2>&1 | tee "${LOG}/eval.log"
-            echo "[MT-Bench] ${METHOD}, lr=${LR} evaluation DONE"
+            EVAL_EXIT=${PIPESTATUS[0]}
+            set -e
+            EVAL_ELAPSED=$(( $(date +%s) - EVAL_START ))
+            echo -e "${METHOD}\t${LR}\tjudge\t${EVAL_ELAPSED}\t${BATCH_SIZE}\t${GRAD_ACCUM}\t${MAX_SEQ_LENGTH}\t${WARMUP_STEPS}\t${CKPT}\t${EVAL_EXIT}" >> "${METRICS_FILE}"
+            if [ "${EVAL_EXIT}" -eq 0 ] && [ -f "${EVAL_SUMMARY_FILE}" ]; then
+                SUMMARY_LINE="$(awk -F'\t' -v run_id="${RUN_ID}" '$2 == run_id { line=$0 } END { print line }' "${EVAL_SUMMARY_FILE}")"
+                if [ -n "${SUMMARY_LINE}" ]; then
+                    IFS=$'\t' read -r _ts _run_id _model_id _algorithm _lr _tag _judge TURN1 TURN2 AVG _model_path <<< "${SUMMARY_LINE}"
+                fi
+            fi
+            echo "[MT-Bench] ${METHOD}, lr=${LR} llm_judge exit=${EVAL_EXIT}, avg=${AVG:-NA}"
         fi
+
+        REPORT_TMP="${RUN_REPORT_TSV}.tmp"
+        awk -F'\t' -v run_id="${RUN_ID}" 'NR == 1 || $1 != run_id' "${RUN_REPORT_TSV}" > "${REPORT_TMP}"
+        mv "${REPORT_TMP}" "${RUN_REPORT_TSV}"
+        echo -e "${RUN_ID}\t${METHOD}\t${LR}\t${RUN_TAG}\t${TARGET_PARAMS}\t${BATCH_SIZE}\t${GRAD_ACCUM}\t${MAX_SEQ_LENGTH}\t${LR_SCHEDULER_TYPE}\t${WARMUP_STEPS}\t${SMT_ATTENTION_TARGET_MODULES}\t${SMT_MLP_TARGET_MODULES}\t${SMT_BUDGET_ALLOCATION}\t${S2FT_SELECTION_METHOD}\t${S2FT_TARGET_PROJECTIONS}\t${RAPA_DATA_FORMAT}\t${RAPA_TRAIN_ON_SOURCE}\t${TRAIN_ELAPSED}\t${TRAIN_EXIT}\t${EVAL_ELAPSED}\t${EVAL_EXIT}\t${TURN1}\t${TURN2}\t${AVG}\t${CKPT}" >> "${RUN_REPORT_TSV}"
+        write_markdown_report
     done
 done
 
 echo "========================================"
 echo "[MT-Bench] ALL RUNS COMPLETE"
 echo "Results: ${RESULTS}"
+echo "Run report: ${RUN_REPORT_MD}"
+echo "Judge summary: ${EVAL_SUMMARY_FILE}"
 echo "========================================"

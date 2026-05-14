@@ -21,7 +21,7 @@ CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-${RAPA_HOME}}"
 CACHE_ROOT="${CACHE_ROOT:-${RAPA_HOME}/hf_cache}"
 TMPDIR="${TMPDIR:-${SCRATCH_ROOT}/tmp}"
-MODEL="${MODEL:-meta-llama/Llama-2-7b-hf}"
+MODEL="${MODEL:-meta-llama/LLama-2-7b-hf}"
 # MODEL="${MODEL:-/raid/models/models--meta-llama--LLaMA-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9}"
 DATASET="${DATASET:-${RAPA_HOME}/OwLore_Dataset/merge/merged_json.json}"
 RESULT_ROOT="${RESULT_ROOT:-${RAPA_HOME}/sparse_ft_320m_7b_csr_single_gpu}"
@@ -199,6 +199,12 @@ if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${METRICS_FILE}" ]; then
     echo -e "method\tphase\telapsed_seconds\tpeak_memory_mb\tpeak_cpu_pss_mb\tpeak_cpu_rss_sum_mb\tpeak_cpu_rss_max_mb\tpeak_system_mem_delta_mb\tbatch_size\tgradient_accumulation_steps\texit_code" > "${METRICS_FILE}"
 fi
 
+log_metric_value() {
+    local log_file="$1"
+    local key="$2"
+    grep -E "${key}=" "${log_file}" 2>/dev/null | tail -n 1 | awk -F'=' '{gsub(/[^0-9.]/, "", $2); print $2}'
+}
+
 gpu_used_mb() {
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${NVIDIA_SMI_GPU_ID}" 2>/dev/null \
         | awk 'NR == 1 { gsub(/ /, ""); print int($1); found=1 } END { if (!found) print 0 }'
@@ -326,13 +332,18 @@ start_gpu_monitor() {
         last_log=0
         while [ ! -f "${stop_file}" ]; do
             mem="$(gpu_used_mb)"
+            job_mem="$(job_gpu_used_mb "${root_pid}")"
+            sample_mem="${mem}"
+            if [ "${job_mem}" -gt "${sample_mem}" ]; then
+                sample_mem="${job_mem}"
+            fi
             read -r cpu_rss_sum cpu_rss_max cpu_pss < <(cpu_stats_mb "${root_pid}")
             system_delta=$(( $(system_used_mem_mb) - baseline_system_used ))
             if [ "${system_delta}" -lt 0 ]; then
                 system_delta=0
             fi
-            if [ "${mem}" -gt "${peak}" ]; then
-                peak="${mem}"
+            if [ "${sample_mem}" -gt "${peak}" ]; then
+                peak="${sample_mem}"
                 echo "${peak}" > "${peak_file}"
             fi
             if [ "${cpu_pss}" -gt "${cpu_pss_peak}" ]; then
@@ -354,20 +365,24 @@ start_gpu_monitor() {
             now="$(date +%s)"
             if [ -n "${status_log}" ] && [ $((now - last_log)) -ge "${GPU_MONITOR_LOG_INTERVAL}" ]; then
                 elapsed=$((now - start_ts))
-                job_mem="$(job_gpu_used_mb "${root_pid}")"
                 echo "[csr] ${method} ${phase} status elapsed_seconds=${elapsed} gpu_memory_mb=${mem} job_gpu_memory_mb=${job_mem} peak_memory_mb=${peak} cpu_pss_mb=${cpu_pss} peak_cpu_pss_mb=${cpu_pss_peak} cpu_rss_sum_mb=${cpu_rss_sum} peak_cpu_rss_sum_mb=${cpu_rss_sum_peak} cpu_rss_max_mb=${cpu_rss_max} peak_cpu_rss_max_mb=${cpu_rss_max_peak} system_mem_delta_mb=${system_delta} peak_system_mem_delta_mb=${system_delta_peak}" | tee -a "${status_log}"
                 last_log="${now}"
             fi
             sleep "${GPU_MONITOR_INTERVAL}"
         done
         mem="$(gpu_used_mb)"
+        job_mem="$(job_gpu_used_mb "${root_pid}")"
+        sample_mem="${mem}"
+        if [ "${job_mem}" -gt "${sample_mem}" ]; then
+            sample_mem="${job_mem}"
+        fi
         read -r cpu_rss_sum cpu_rss_max cpu_pss < <(cpu_stats_mb "${root_pid}")
         system_delta=$(( $(system_used_mem_mb) - baseline_system_used ))
         if [ "${system_delta}" -lt 0 ]; then
             system_delta=0
         fi
-        if [ "${mem}" -gt "${peak}" ]; then
-            peak="${mem}"
+        if [ "${sample_mem}" -gt "${peak}" ]; then
+            peak="${sample_mem}"
         fi
         if [ "${cpu_pss}" -gt "${cpu_pss_peak}" ]; then
             cpu_pss_peak="${cpu_pss}"
@@ -446,36 +461,39 @@ for method in ${METHODS}; do
         train_start="$(date +%s)"
         train_peak_file="${log_dir}/train_peak_memory_mb.txt"
         train_stop_file="${log_dir}/train_peak_memory.stop"
-        start_gpu_monitor "${train_peak_file}" "${train_stop_file}" "${log_dir}/train.log" "train" "${method}" "${train_start}" "$$"
 
         set +e
-        deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" \
-            "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py" \
-            --method "${method}" \
-            --model_name_or_path "${MODEL}" \
-            --dataset_path "${DATASET}" \
-            --output_dir "${ckpt}" \
-            --num_train_epochs "${EPOCHS}" \
-            --per_device_train_batch_size "${BATCH_SIZE}" \
-            --gradient_accumulation_steps "${GRAD_ACCUM}" \
-            --learning_rate "${LEARNING_RATE}" \
-            --lr_scheduler_type cosine \
-            --max_seq_length "${MAX_SEQ_LENGTH}" \
-            --target_params "${TARGET_PARAMS}" \
-            --sift_calibration_steps "${SIFT_CALIBRATION_STEPS}" \
-            --sift_calibration_batch_size "${SIFT_CALIBRATION_BATCH_SIZE}" \
-            --smt_calibration_steps "${SMT_CALIBRATION_STEPS}" \
-            --smt_calibration_batch_size "${SMT_CALIBRATION_BATCH_SIZE}" \
-            --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
-            --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
-            --s2ft_selection_method "${S2FT_SELECTION_METHOD}" \
-            --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
-            --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
-            --bf16 \
-            --seed 42 \
-            "${extra_args[@]}" \
-            2>&1 | tee "${log_dir}/train.log"
-        train_ec=${PIPESTATUS[0]}
+        (
+            deepspeed --include=localhost:"${GPU_INDEX}" --master_port="${port}" \
+                "${LMFLOW_DIR}/src/lmflow/pipeline/rapa/train_method.py" \
+                --method "${method}" \
+                --model_name_or_path "${MODEL}" \
+                --dataset_path "${DATASET}" \
+                --output_dir "${ckpt}" \
+                --num_train_epochs "${EPOCHS}" \
+                --per_device_train_batch_size "${BATCH_SIZE}" \
+                --gradient_accumulation_steps "${GRAD_ACCUM}" \
+                --learning_rate "${LEARNING_RATE}" \
+                --lr_scheduler_type cosine \
+                --max_seq_length "${MAX_SEQ_LENGTH}" \
+                --target_params "${TARGET_PARAMS}" \
+                --sift_calibration_steps "${SIFT_CALIBRATION_STEPS}" \
+                --sift_calibration_batch_size "${SIFT_CALIBRATION_BATCH_SIZE}" \
+                --smt_calibration_steps "${SMT_CALIBRATION_STEPS}" \
+                --smt_calibration_batch_size "${SMT_CALIBRATION_BATCH_SIZE}" \
+                --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
+                --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
+                --s2ft_selection_method "${S2FT_SELECTION_METHOD}" \
+                --ltsft_mask_search_steps "${LTSFT_MASK_SEARCH_STEPS}" \
+                --ltsft_n_ft_iterations "${LTSFT_N_FT_ITERATIONS}" \
+                --bf16 \
+                --seed 42 \
+                "${extra_args[@]}"
+        ) > >(tee "${log_dir}/train.log") 2>&1 &
+        train_pid="$!"
+        start_gpu_monitor "${train_peak_file}" "${train_stop_file}" "${log_dir}/train.log" "train" "${method}" "${train_start}" "${train_pid}"
+        wait "${train_pid}"
+        train_ec=$?
         set -e
 
         train_elapsed=$(( $(date +%s) - train_start ))
@@ -484,8 +502,27 @@ for method in ${METHODS}; do
         train_peak_cpu_rss_sum_mb="$(cat "$(cpu_rss_sum_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
         train_peak_cpu_rss_max_mb="$(cat "$(cpu_rss_max_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
         train_peak_system_delta_mb="$(cat "$(system_delta_peak_file_for "${train_peak_file}")" 2>/dev/null || echo 0)"
+        calibration_elapsed="$(log_metric_value "${log_dir}/train.log" "calibration_seconds" || true)"
+        calibration_peak_gpu="$(log_metric_value "${log_dir}/train.log" "calibration_peak_reserved_mb" || true)"
+        calibration_peak_cpu_pss="$(log_metric_value "${log_dir}/train.log" "calibration_peak_cpu_pss_mb" || true)"
+        calibration_peak_cpu_rss="$(log_metric_value "${log_dir}/train.log" "calibration_peak_cpu_rss_mb" || true)"
+        if [ "${train_peak_mb}" -eq 0 ] && [ -n "${calibration_peak_gpu}" ] && [ "${calibration_peak_gpu}" -gt 0 ]; then
+            train_peak_mb="${calibration_peak_gpu}"
+            echo "[csr] ${method} train monitor fallback: using calibration_peak_reserved_mb=${calibration_peak_gpu} because outer peak_memory_mb was 0" | tee -a "${log_dir}/train.log"
+        fi
         echo "[csr] ${method} train elapsed_seconds=${train_elapsed} peak_memory_mb=${train_peak_mb} peak_cpu_pss_mb=${train_peak_cpu_pss_mb} peak_cpu_rss_sum_mb=${train_peak_cpu_rss_sum_mb} peak_cpu_rss_max_mb=${train_peak_cpu_rss_max_mb} peak_system_mem_delta_mb=${train_peak_system_delta_mb} exit=${train_ec}" | tee -a "${log_dir}/train.log"
         echo -e "${method}\ttrain\t${train_elapsed}\t${train_peak_mb}\t${train_peak_cpu_pss_mb}\t${train_peak_cpu_rss_sum_mb}\t${train_peak_cpu_rss_max_mb}\t${train_peak_system_delta_mb}\t${BATCH_SIZE}\t${GRAD_ACCUM}\t${train_ec}" >> "${METRICS_FILE}"
+        if [ -n "${calibration_elapsed}" ]; then
+            calibration_batch_size="${SMT_CALIBRATION_BATCH_SIZE}"
+            if [ "${method}" = "sift" ]; then
+                calibration_batch_size="${SIFT_CALIBRATION_BATCH_SIZE}"
+            elif [ "${method}" = "s2ft" ]; then
+                calibration_batch_size="${S2FT_CALIBRATION_BATCH_SIZE}"
+            fi
+            echo -e "${method}\tcalibration\t${calibration_elapsed}\t${calibration_peak_gpu:-0}\t${calibration_peak_cpu_pss:-0}\t${calibration_peak_cpu_rss:-0}\t${calibration_peak_cpu_rss:-0}\t0\t${calibration_batch_size}\t\t${train_ec}" >> "${METRICS_FILE}"
+        elif [ "${method}" = "s2ft" ] && [ "${S2FT_CALIBRATION_STEPS}" -eq 0 ]; then
+            echo -e "${method}\tcalibration\t0\t0\t0\t0\t0\t0\t${S2FT_CALIBRATION_BATCH_SIZE}\t\t${train_ec}" >> "${METRICS_FILE}"
+        fi
     else
         if [ ! -f "${ckpt}/config.json" ]; then
             echo "[csr] ${method} checkpoint not found for eval-only mode: ${ckpt}" | tee -a "${log_dir}/train.log"

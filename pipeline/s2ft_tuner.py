@@ -351,6 +351,9 @@ def _select_units(
     rng = random.Random(seed)
 
     if method in {"small_activation", "activation", "large_activation", "large"}:
+        calibration_start = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         scores, completed_steps = _collect_s2ft_activation_scores(
             model=model,
             train_dataset=train_dataset,
@@ -359,6 +362,15 @@ def _select_units(
             calibration_batch_size=calibration_batch_size,
             data_collator=data_collator,
         )
+        calibration_seconds = time.time() - calibration_start
+        calibration_peak_allocated = 0
+        calibration_peak_reserved = 0
+        if torch.cuda.is_available():
+            calibration_peak_allocated = torch.cuda.max_memory_allocated() // (1024 * 1024)
+            calibration_peak_reserved = torch.cuda.max_memory_reserved() // (1024 * 1024)
+        logger.info(f"[S2FT] calibration_seconds={calibration_seconds:.2f}")
+        logger.info(f"[S2FT] calibration_peak_allocated_mb={calibration_peak_allocated}")
+        logger.info(f"[S2FT] calibration_peak_reserved_mb={calibration_peak_reserved}")
         if allocation == "uniform":
             selected = {
                 "v": _choose_units_uniform(scores["v"], num_layers, num_kv_heads, ratios["v"], method, rng),
