@@ -46,7 +46,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-2}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 RESET_RESULTS="${RESET_RESULTS:-false}"
 GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-5}"
-GPU_MONITOR_LOG_INTERVAL="${GPU_MONITOR_LOG_INTERVAL:-60}"
+GPU_MONITOR_LOG_INTERVAL="${GPU_MONITOR_LOG_INTERVAL:-0}"
 MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-0}"
 SYNC_LMFLOW="${SYNC_LMFLOW:-auto}"
 RESUME_TRAINING="${RESUME_TRAINING:-false}"
@@ -389,7 +389,7 @@ start_gpu_monitor() {
                 echo "${system_delta_peak}" > "${system_delta_peak_file}"
             fi
             now="$(date +%s)"
-            if [ -n "${status_log}" ] && [ $((now - last_log)) -ge "${GPU_MONITOR_LOG_INTERVAL}" ]; then
+            if [ -n "${status_log}" ] && [ "${GPU_MONITOR_LOG_INTERVAL}" -gt 0 ] && [ $((now - last_log)) -ge "${GPU_MONITOR_LOG_INTERVAL}" ]; then
                 elapsed=$((now - start_ts))
                 job_mem="$(job_gpu_used_mb "${root_pid}")"
                 echo "[mmlu] ${method} ${phase} status elapsed_seconds=${elapsed} gpu_memory_mb=${mem} job_gpu_memory_mb=${job_mem} peak_memory_mb=${peak} cpu_pss_mb=${cpu_pss} peak_cpu_pss_mb=${cpu_pss_peak} cpu_rss_sum_mb=${cpu_rss_sum} peak_cpu_rss_sum_mb=${cpu_rss_sum_peak} cpu_rss_max_mb=${cpu_rss_max} peak_cpu_rss_max_mb=${cpu_rss_max_peak} system_mem_delta_mb=${system_delta} peak_system_mem_delta_mb=${system_delta_peak}" | tee -a "${status_log}"
@@ -425,6 +425,8 @@ start_gpu_monitor() {
         echo "${system_delta_peak}" > "${system_delta_peak_file}"
     ) &
     GPU_MONITOR_PID="$!"
+    GPU_MONITOR_PIDS+=("${GPU_MONITOR_PID}")
+    GPU_MONITOR_STOP_FILES+=("${stop_file}")
 }
 
 stop_gpu_monitor() {
@@ -434,6 +436,25 @@ stop_gpu_monitor() {
     wait "${GPU_MONITOR_PID}" 2>/dev/null || true
     cat "${peak_file}"
 }
+
+GPU_MONITOR_PIDS=()
+GPU_MONITOR_STOP_FILES=()
+
+cleanup_gpu_monitors() {
+    local stop_file
+    local pid
+
+    for stop_file in "${GPU_MONITOR_STOP_FILES[@]:-}"; do
+        [ -n "${stop_file}" ] && touch "${stop_file}" 2>/dev/null || true
+    done
+    for pid in "${GPU_MONITOR_PIDS[@]:-}"; do
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+        fi
+    done
+}
+
+trap cleanup_gpu_monitors EXIT INT TERM
 
 cpu_pss_peak_file_for() {
     local peak_file="$1"

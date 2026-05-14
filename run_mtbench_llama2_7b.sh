@@ -1,5 +1,5 @@
 #!/bin/bash
-# MT-Bench sparse fine-tuning pipeline: SMT/S2FT over OASST1.
+# MT-Bench sparse fine-tuning pipeline: SMT/S2FT over OASST1, Llama-2-7B variant.
 set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-sparse-ft}"
@@ -16,13 +16,20 @@ RAPA_BASE="${RAPA_HOME:-${LLM_ROOT}/rapa}"
 LMFLOW_DIR="${LMFLOW_DIR:-${RAPA_BASE}/LMFlow}"
 CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-}"
 
-MODEL="${MODEL:-mistralai/Mistral-7B-v0.3}"
+MODEL="${MODEL:-meta-llama/Llama-2-7b-hf}"
 DATASET="${DATASET:-${DATA:-oasst1}}"
-RESULT_ROOT="${RESULT_ROOT:-${RAPA_BASE}/sparse_ft_170m_mistral7b_mtbench_single_gpu}"
+MODEL_RUN_TAG="${MODEL_RUN_TAG:-llama2_7b}"
+USER_RUN_TAG="${RUN_TAG:-}"
+if [ -n "${USER_RUN_TAG}" ]; then
+    RUN_TAG="${MODEL_RUN_TAG}_${USER_RUN_TAG}"
+else
+    RUN_TAG="${MODEL_RUN_TAG}"
+fi
+RESULT_ROOT="${RESULT_ROOT:-${RAPA_BASE}/sparse_ft_170m_llama2_7b_mtbench_single_gpu}"
 RESULTS="${RESULTS:-${RESULT_ROOT}/results.md}"
 METRICS_FILE="${METRICS_FILE:-${RESULT_ROOT}/metrics.tsv}"
 
-METHODS="${METHODS:-s2ft smt}"
+METHODS="${METHODS:-smt s2ft}"
 TARGET_PARAMS="${TARGET_PARAMS:-170000000}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 EPOCHS="${EPOCHS:-1}"
@@ -48,11 +55,10 @@ LLM_JUDGE_CONDA_ENV="${LLM_JUDGE_CONDA_ENV:-llmjudge_iclr2026}"
 EVAL_SUMMARY_FILE="${EVAL_SUMMARY_FILE:-${RESULT_ROOT}/mtbench_judge_summary.tsv}"
 RUN_REPORT_TSV="${RUN_REPORT_TSV:-${RESULT_ROOT}/run_report.tsv}"
 RUN_REPORT_MD="${RUN_REPORT_MD:-${RESULT_ROOT}/run_report.md}"
-RUN_TAG="${RUN_TAG:-}"
+RUN_TAG="${RUN_TAG:-${MODEL_RUN_TAG}}"
 
 # SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-100}"
-# SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-20}"
-SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-1}"
+SMT_CALIBRATION_STEPS="${SMT_CALIBRATION_STEPS:-20}"
 SMT_CALIBRATION_BATCH_SIZE="${SMT_CALIBRATION_BATCH_SIZE:-1}"
 if [ -n "${SMT_TARGET_MODULES:-}" ]; then
     echo "[mtbench] Ignoring legacy SMT_TARGET_MODULES=${SMT_TARGET_MODULES}; use SMT_ATTENTION_TARGET_MODULES/SMT_MLP_TARGET_MODULES instead."
@@ -100,7 +106,6 @@ export RAPA_HOME="${RAPA_BASE}"
 export SPARSE_FT_ROOT
 export PEFT_DIR="${PEFT_DIR:-${RAPA_BASE}/peft}"
 export PYTHONPATH="${LMFLOW_DIR}/src:${SPARSE_FT_ROOT}:${PYTHONPATH:-}"
-# export DS_CONFIG="${DS_CONFIG:-${LMFLOW_DIR}/configs/rapa/ds_zero1.json}"
 export DS_CONFIG="${DS_CONFIG:-${LMFLOW_DIR}/configs/ds_config_zero0_no_offload.json}"
 export SMT_CALIBRATION_STEPS SMT_CALIBRATION_BATCH_SIZE
 export SMT_ATTENTION_TARGET_MODULES SMT_MLP_TARGET_MODULES
@@ -163,7 +168,7 @@ fi
 
 if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS}" ]; then
     {
-        echo "# MT-Bench 170M Mistral-7B-v0.3 Sparse FT Single-GPU Results"
+        echo "# MT-Bench 170M Llama-2-7B Sparse FT Single-GPU Results"
         echo ""
         echo "- model: ${MODEL}"
         echo "- dataset: ${DATASET_PATH}"
@@ -174,6 +179,9 @@ if [ "${RESET_RESULTS}" = "true" ] || [ ! -f "${RESULTS}" ]; then
         echo "- gradient_accumulation_steps: ${GRAD_ACCUM}"
         echo "- max_seq_length: ${MAX_SEQ_LENGTH}"
         echo "- warmup_steps: ${WARMUP_STEPS}"
+        echo "- deepspeed_config: ${DS_CONFIG}"
+        echo "- model_run_tag: ${MODEL_RUN_TAG}"
+        echo "- user_run_tag: ${USER_RUN_TAG:-none}"
         echo "- run_tag: ${RUN_TAG:-none}"
         echo "- eval_script: ${LLM_JUDGE_SCRIPT}"
         echo "- judge_model: ${JUDGE_MODEL}"
@@ -310,7 +318,6 @@ for METHOD in ${METHODS}; do
                 --s2ft_calibration_steps "${S2FT_CALIBRATION_STEPS}" \
                 --s2ft_calibration_batch_size "${S2FT_CALIBRATION_BATCH_SIZE}" \
                 --s2ft_selection_method "${S2FT_SELECTION_METHOD}" \
-                --bf16 \
                 --seed 42 \
                 "${EXTRA_ARGS[@]}" \
                 2>&1 | tee "${LOG}/train.log"

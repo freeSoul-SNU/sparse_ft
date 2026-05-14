@@ -35,12 +35,9 @@ except ImportError:
     from s2ft import S2ColumnLinear, S2RowLinear
 
 try:
-    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+    from .data_utils import build_lmflow_text_dataset
 except ImportError:
-    try:
-        from .data_utils import build_lmflow_text_dataset
-    except ImportError:
-        from data_utils import build_lmflow_text_dataset
+    from data_utils import build_lmflow_text_dataset
 
 
 def _deepspeed_config(default_path):
@@ -555,8 +552,9 @@ def _restore_s2_linear_modules(model):
 def train_s2ft(
     model_name_or_path, dataset_path, output_dir, num_train_epochs=1, max_steps=-1,
     per_device_train_batch_size=1, gradient_accumulation_steps=1, learning_rate=5e-5,
-    lr_scheduler_type="linear", warmup_steps=0, max_seq_length=512, target_params=170_000_000,
-    bf16=True, hf_token=None, seed=42, report_to="none",
+    lr_scheduler_type="linear", warmup_steps=0, warmup_ratio=0.0,
+    max_seq_length=512, target_params=170_000_000,
+    bf16=False, hf_token=None, seed=42, report_to="none", trust_remote_code=False,
     s2ft_calibration_steps=None, s2ft_calibration_batch_size=None,
     s2ft_v_ratio=None, s2ft_o_ratio=None, s2ft_u_ratio=None, s2ft_d_ratio=None,
     s2ft_selection_method=None,
@@ -564,12 +562,21 @@ def train_s2ft(
 ):
     os.makedirs(output_dir, exist_ok=True)
     tok_kwargs = {"token": hf_token} if hf_token else {}
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        use_fast=False,
+        legacy=True,
+        trust_remote_code=trust_remote_code,
+        **tok_kwargs,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+        trust_remote_code=trust_remote_code,
         **tok_kwargs,
     )
 
@@ -647,6 +654,7 @@ def train_s2ft(
         learning_rate=learning_rate,
         lr_scheduler_type=lr_scheduler_type,
         warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
         bf16=bf16,
         save_strategy="no" if 0 < max_steps < 100 else "epoch",
         logging_steps=5,

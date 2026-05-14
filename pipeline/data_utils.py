@@ -268,9 +268,9 @@ def build_lmflow_text_dataset(dataset_path, tokenizer, max_seq_length, dynamic_p
         dynamic_padding = _env_bool("RAPA_USE_DYNAMIC_PADDING", True)
 
     dataset_type, instances = load_lmflow_instances(dataset_path)
-    if dataset_type not in {None, "text_only"}:
+    if dataset_type not in {None, "text_only", "instruction"}:
         raise ValueError(
-            f"Only LMFlow text_only datasets are supported here; got type={dataset_type!r}"
+            f"Only text_only/instruction datasets are supported here; got type={dataset_type!r}"
         )
     data_format = os.environ.get("RAPA_DATA_FORMAT", "text").lower()
     train_on_source = _env_bool("RAPA_TRAIN_ON_SOURCE", False)

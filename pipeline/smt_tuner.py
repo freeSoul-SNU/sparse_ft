@@ -28,12 +28,9 @@ RAPA_HOME = os.environ.get("RAPA_HOME", "/data/nksol0405/LLM/rapa")
 BLOCK_DIM = 256  # SMT block dimension
 
 try:
-    from lmflow.pipeline.rapa.data_utils import build_lmflow_text_dataset
+    from .data_utils import build_lmflow_text_dataset
 except ImportError:
-    try:
-        from .data_utils import build_lmflow_text_dataset
-    except ImportError:
-        from data_utils import build_lmflow_text_dataset
+    from data_utils import build_lmflow_text_dataset
 
 
 def _deepspeed_config(default_path):
@@ -477,12 +474,14 @@ def train_smt(
     learning_rate=5e-5,
     lr_scheduler_type="linear",
     warmup_steps=0,
+    warmup_ratio=0.0,
     max_seq_length=512,
     target_params=170_000_000,
-    bf16=True,
+    bf16=False,
     hf_token=None,
     seed=42,
     report_to="none",
+    trust_remote_code=False,
     smt_calibration_steps=None,
     smt_calibration_batch_size=None,
     **kwargs,
@@ -504,13 +503,22 @@ def train_smt(
         smt_calibration_batch_size = int(os.environ.get("SMT_CALIBRATION_BATCH_SIZE", "1"))
 
     tok_kwargs = {"token": hf_token} if hf_token else {}
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        use_fast=False,
+        legacy=True,
+        trust_remote_code=trust_remote_code,
+        **tok_kwargs,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+        trust_remote_code=trust_remote_code,
         **tok_kwargs,
     )
 
@@ -627,6 +635,7 @@ def train_smt(
         learning_rate=learning_rate,
         lr_scheduler_type=lr_scheduler_type,
         warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
         bf16=bf16,
         save_strategy=save_strategy,
         logging_steps=5,
@@ -655,12 +664,9 @@ def train_smt(
 
     # Restore to clean nn.Linear for vLLM/HF loading
     try:
-        from lmflow.pipeline.rapa.sift_tuner import restore_linear_modules
+        from .sift_tuner import restore_linear_modules
     except ImportError:
-        try:
-            from .sift_tuner import restore_linear_modules
-        except ImportError:
-            from sift_tuner import restore_linear_modules
+        from sift_tuner import restore_linear_modules
     model = restore_linear_modules(model)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)

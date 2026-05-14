@@ -67,7 +67,7 @@ def parse_args():
                    help="LT-SFT dense lottery-ticket mask-search steps (default: env LTSFT_MASK_SEARCH_STEPS or 100)")
     p.add_argument("--ltsft_n_ft_iterations", type=int, default=None,
                    help="LT-SFT full/sparse fine-tuning iterations (default: env LTSFT_N_FT_ITERATIONS or 1)")
-    p.add_argument("--bf16", action="store_true", default=True)
+    p.add_argument("--bf16", action="store_true", default=False)
     p.add_argument("--hf_token", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--report_to", type=str, default="none")
