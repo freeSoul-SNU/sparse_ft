@@ -99,7 +99,7 @@ export LTSFT_MASK_SEARCH_STEPS="${LTSFT_MASK_SEARCH_STEPS:-100}"
 export LTSFT_N_FT_ITERATIONS="${LTSFT_N_FT_ITERATIONS:-1}"
 export RAPA_DATALOADER_NUM_WORKERS="${RAPA_DATALOADER_NUM_WORKERS:-0}"
 export RAPA_DATALOADER_PIN_MEMORY="${RAPA_DATALOADER_PIN_MEMORY:-false}"
-export RAPA_USE_DYNAMIC_PADDING="${RAPA_USE_DYNAMIC_PADDING:-true}"
+export RAPA_USE_DYNAMIC_PADDING="${RAPA_USE_DYNAMIC_PADDING:-false}"
 
 # SMT official PEFT example uses q/k/v attention submatrices by default
 # (--num_submatrix_mlp 0, --target_modules q_proj/k_proj/v_proj).
